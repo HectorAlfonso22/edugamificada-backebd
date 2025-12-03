@@ -4,4 +4,7 @@ uvicorn[standard]
 SQLAlchemy>=2.0
 psycopg2-binary
 python-dotenv
+passlib[bcrypt]
+python-jose[cryptography]
+argon2-cffi
 "@ | Out-File -Encoding utf8 requirements.txt
