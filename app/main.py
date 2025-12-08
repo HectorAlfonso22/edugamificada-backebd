@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from jose import JWTError, jwt
+from openai import OpenAI
 from passlib.context import CryptContext
 from pydantic import BaseModel
 from sqlalchemy import create_engine, text
@@ -100,6 +101,9 @@ JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "4320"))
 pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
 SubjectLiteral = Literal["castellano", "matematica"]
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 # ---------------------------
 # FastAPI + CORS
@@ -196,6 +200,77 @@ def sanitize_user(row: dict) -> dict:
         "age": row.get("age"),
         "created_at": created_at,
     }
+
+
+def generate_ai_summary(context: dict) -> Optional[dict]:
+    if not openai_client:
+        return None
+
+    def _parse_json_safely(raw: str) -> Optional[dict]:
+        try:
+            cleaned = raw.strip()
+            if cleaned.startswith("```"):
+                cleaned = cleaned.strip("`")
+                if cleaned.lower().startswith("json"):
+                    cleaned = cleaned[4:].strip()
+            return json.loads(cleaned)
+        except Exception as exc:
+            logger.error("AI summary JSON parse failed: %s | raw=%r", exc, raw[:500])
+            return None
+
+    def _extract_content(choice) -> str:
+        """
+        Normaliza el contenido devuelto por la API de OpenAI (string o lista de partes).
+        """
+        msg = choice.message
+        content = getattr(msg, "content", "")
+        if isinstance(content, list):
+            parts = []
+            for part in content:
+                if isinstance(part, str):
+                    parts.append(part)
+                elif isinstance(part, dict):
+                    parts.append(part.get("text") or "")
+                else:
+                    txt = getattr(part, "text", None)
+                    if txt:
+                        parts.append(txt)
+            return "\n".join([p for p in parts if p])
+        return content or ""
+
+    prompt = f"""
+Eres un tutor educativo. Resume el progreso del alumno usando estos datos:
+Intentos: {context['attempts']}
+Precisión: {context['accuracy_percent']}%
+Tiempo promedio por pregunta (s): {context['time_avg_s']}
+Habilidades más débiles: {context['weak_list']}
+
+Responde en JSON con las llaves: overview (string breve), strengths (lista de strings), focus (lista de strings).
+Sé concreto y amable.
+"""
+    models_to_try = [OPENAI_MODEL] if OPENAI_MODEL else []
+    if "gpt-4o-mini" not in models_to_try:
+        models_to_try.append("gpt-4o-mini")
+
+    for mdl in models_to_try:
+        try:
+            resp = openai_client.chat.completions.create(
+                model=mdl,
+                messages=[{"role": "user", "content": prompt}],
+                max_completion_tokens=180,
+                response_format={"type": "json_object"},
+            )
+            raw = _extract_content(resp.choices[0])
+            if not raw.strip():
+                logger.warning("AI summary returned empty content | model=%s | message=%r", mdl, resp.choices[0].message)
+                continue
+            parsed = _parse_json_safely(raw)
+            if parsed:
+                return parsed
+        except Exception as exc:
+            logger.error("AI summary failed with model %s: %s", mdl, exc)
+
+    return None
 
 
 def get_token_from_request(request: Request) -> str:
@@ -600,6 +675,7 @@ def get_progress(student_id: UUID, subject: str):
 @app.get("/next-items")
 def next_items(
     request: Request,
+    mode: str = Query("adaptive"),
     subject: str = Query(...),   # sin regex para no bloquear
     k: int = Query(5, ge=1, le=20),
     student_id: Optional[str] = Query(None, min_length=8),
@@ -623,28 +699,43 @@ def next_items(
     )
 
     # 1) Consulta principal: AHORA incluye i.answer
-    sql = text(
-        """
+    base_sql = """
         select 
             i.id,
             i.type,
             i.prompt,
             i.options,
             i.answer,
-            i.skill_id
+            i.skill_id,
+            coalesce(m.p_mastery, 0.3) as mastery_score
         from items i
         join skills s on s.id = i.skill_id
+        left join mastery m on m.skill_id = i.skill_id and m.student_id = :student_id
         where lower(trim(
             replace(replace(replace(replace(replace(s.subject,'á','a'),'é','e'),'í','i'),'ó','o'),'ú','u')
         )) = :subject
-        order by random()
-        limit :k
-        """
-    )
+    """
+
+    if mode == "adaptive":
+        sql = text(
+            base_sql
+            + """
+            order by mastery_score asc, random()
+            limit :k
+            """
+        )
+    else:
+        sql = text(
+            base_sql
+            + """
+            order by random()
+            limit :k
+            """
+        )
 
     try:
         with engine.begin() as conn:
-            rows = conn.execute(sql, {"subject": subj, "k": k}).mappings().all()
+            rows = conn.execute(sql, {"subject": subj, "k": k, "student_id": token_student_id}).mappings().all()
 
             # Fallback: si no encuentra para ese subject, trae cualquiera
             if not rows:
@@ -695,6 +786,7 @@ def next_items(
                     "skill_id": skill_val,
                     "answer": r.get("answer"),
                     "subject": subj,
+                    "reason": "refuerzo" if mode == "adaptive" else "aleatorio",
                 }
             )
 
@@ -717,6 +809,7 @@ def next_items(
                     "skill_id": None,
                     "answer": r.get("answer"),
                     "subject": subj,
+                    "reason": "custom",
                 }
             )
 
@@ -769,6 +862,96 @@ def report_student(sid: str, request: Request):
             "time_avg_ms": int(kpis["t_avg"] or 0),
             "weak_skills": [{"name": w["name"], "p": float(w["p"])} for w in weak],
         }
+
+
+@app.get("/reports/summary")
+def report_summary(request: Request, sid: str):
+    requester = require_user(request, allowed_roles=["student", "teacher"])
+    if requester["role"] == "student" and str(requester["id"]) != sid:
+        raise HTTPException(status_code=403, detail="No puedes ver reportes de otros estudiantes")
+
+    with engine.begin() as conn:
+        kpis = conn.execute(
+            text(
+                """
+                select
+                  count(*) as n,
+                  avg(case when correct then 1.0 else 0.0 end) as acc,
+                  avg(time_ms) as t_avg
+                from attempts
+                where student_id=:sid
+                """
+            ),
+            dict(sid=sid),
+        ).mappings().one()
+
+        weak = conn.execute(
+            text(
+                """
+                select s.name, coalesce(m.p_mastery,0.2) as p
+                from skills s
+                left join mastery m on m.skill_id=s.id and m.student_id=:sid
+                order by p asc
+                limit 3
+                """
+            ),
+            dict(sid=sid),
+        ).mappings().all()
+
+    attempts = int(kpis["n"] or 0)
+    accuracy = round(float(kpis["acc"] or 0), 2)
+    time_avg_s = round((kpis["t_avg"] or 0) / 1000, 1)
+    weak_skills = [{"name": w["name"], "p": float(w["p"])} for w in weak]
+
+    context = {
+        "attempts": attempts,
+        "accuracy_percent": int(accuracy * 100),
+        "time_avg_s": time_avg_s,
+        "weak_list": ", ".join([w["name"] for w in weak_skills]) or "ninguna",
+    }
+
+    ai_summary = generate_ai_summary(context)
+    if ai_summary:
+        return {
+            **ai_summary,
+            "attempts": attempts,
+            "accuracy": accuracy,
+            "time_avg_s": time_avg_s,
+            "weak_skills": weak_skills,
+        }
+
+    strengths = []
+    focus = []
+    if accuracy >= 0.8:
+        strengths.append("Muy buena precisión general, sigue así.")
+    elif accuracy >= 0.6:
+        strengths.append("Estás progresando; la precisión va en buen camino.")
+    else:
+        focus.append("Necesitas subir la precisión general con repasos cortos.")
+
+    if time_avg_s <= 6:
+        strengths.append("Respondes rápido, buen ritmo.")
+    else:
+        focus.append("Toma más tiempo para leer enunciados y evitar errores.")
+
+    for w in weak_skills:
+        focus.append(f"Refuerza {w['name']} (dominio {int(w['p']*100)}%).")
+
+    overview = (
+        f"Llevas {attempts} intentos, con {int(accuracy*100)}% de precisión "
+        f"y un tiempo medio de {time_avg_s}s. "
+        "Aquí tienes tus siguientes pasos."
+    )
+
+    return {
+        "overview": overview,
+        "strengths": strengths,
+        "focus": focus,
+        "attempts": attempts,
+        "accuracy": accuracy,
+        "time_avg_s": time_avg_s,
+        "weak_skills": weak_skills,
+    }
 
 @app.get("/db-check")
 def db_check():
