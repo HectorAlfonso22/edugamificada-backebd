@@ -79,12 +79,27 @@ CREATE_CUSTOM_ITEMS_INDEX = text(
     """
 )
 
+CREATE_ACHIEVEMENTS_TABLE = text(
+    """
+    create table if not exists achievements (
+        id bigserial primary key,
+        student_id uuid not null references users(id) on delete cascade,
+        code text not null,
+        title text not null,
+        description text not null,
+        earned_at timestamptz not null default now(),
+        unique (student_id, code)
+    )
+    """
+)
+
 
 def ensure_custom_tables():
     try:
         with engine.begin() as conn:
             conn.execute(CREATE_CUSTOM_ITEMS_TABLE)
             conn.execute(CREATE_CUSTOM_ITEMS_INDEX)
+            conn.execute(CREATE_ACHIEVEMENTS_TABLE)
         logger.info("custom_items table ready")
     except Exception as exc:
         logger.error("Failed to ensure custom_items table: %s", exc)
@@ -104,6 +119,7 @@ SubjectLiteral = Literal["castellano", "matematica"]
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+DAILY_GOAL = int(os.getenv("DAILY_GOAL", "10"))
 
 # ---------------------------
 # FastAPI + CORS
@@ -380,6 +396,30 @@ def require_user(request: Request, allowed_roles: Optional[List[str]] = None) ->
     return row
 
 
+def award_achievement(conn, student_id: str, code: str, title: str, desc: str) -> Optional[dict]:
+    try:
+        row = conn.execute(
+            text(
+                """
+                insert into achievements (student_id, code, title, description)
+                values (:sid, :code, :title, :desc)
+                on conflict (student_id, code) do nothing
+                returning id, code, title, description, earned_at
+                """
+            ),
+            {"sid": student_id, "code": code, "title": title, "desc": desc},
+        ).mappings().first()
+        if row:
+            return {
+                "code": row["code"],
+                "title": row["title"],
+                "description": row["description"],
+                "earned_at": row["earned_at"].isoformat() if row.get("earned_at") else None,
+            }
+    except Exception as exc:
+        logger.warning("award_achievement failed: %s", exc)
+    return None
+
 # ---------------------------
 # Endpoints básicos de salud
 # ---------------------------
@@ -606,6 +646,68 @@ def list_students(request: Request):
     return {"students": students}
 
 
+@app.get("/progress/daily")
+def daily_progress(request: Request, sid: str, subject: Optional[str] = None):
+    user = require_user(request, allowed_roles=["student", "teacher"])
+    # Si es alumno, solo puede ver su propio progreso
+    if user["role"] == "student" and str(user["id"]) != sid:
+        raise HTTPException(status_code=403, detail="No autorizado")
+
+    subj_norm = None
+    if subject:
+        subj_norm = (
+            subject.strip()
+            .lower()
+            .replace("á", "a")
+            .replace("é", "e")
+            .replace("í", "i")
+            .replace("ó", "o")
+            .replace("ú", "u")
+        )
+
+    with engine.begin() as conn:
+        rows = conn.execute(
+            text(
+                """
+                select date(a.created_at) as d, count(*) as n
+                from attempts a
+                join items i on i.id = a.item_id
+                where a.student_id = :sid
+                  and (:subject is null or lower(trim(
+                        replace(replace(replace(replace(replace(i.subject,'á','a'),'é','e'),'í','i'),'ó','o'),'ú','u')
+                  )) = :subject)
+                group by 1
+                order by d desc
+                limit 7
+                """
+            ),
+            {"sid": sid, "subject": subj_norm},
+        ).mappings().all()
+
+    today = date.today()
+    attempts_today = 0
+    streak_days = 0
+    dates_counts = {r["d"]: int(r["n"]) for r in rows}
+    if today in dates_counts:
+        attempts_today = dates_counts[today]
+    # calcular racha desde hoy hacia atrás
+    cursor = today
+    while cursor in dates_counts and dates_counts[cursor] > 0:
+        streak_days += 1
+        cursor = cursor - timedelta(days=1)
+
+    history = [
+        {"date": str(d), "attempts": dates_counts[d]} for d in sorted(dates_counts.keys(), reverse=True)
+    ]
+
+    return {
+        "attempts_today": attempts_today,
+        "goal": DAILY_GOAL,
+        "streak_days": streak_days,
+        "history": history,
+    }
+
+
 # ---------------------------
 # POST /attempts
 # Guarda intento, valida (opcional) y actualiza dominio, SRS y XP
@@ -682,6 +784,14 @@ LIST_STUDENTS_SQL = text(
     order by created_at asc
     """
 )
+LIST_ACHIEVEMENTS_SQL = text(
+    """
+    select code, title, description, earned_at
+    from achievements
+    where student_id = :sid
+    order by earned_at desc
+    """
+)
 LIST_CUSTOM_BY_CREATOR_SQL = text(
     """
     select id, subject, prompt, options, answer, created_at
@@ -744,6 +854,52 @@ async def post_attempt(request: Request):
 
         # 4) Guardamos intento + actualizamos progreso
         attempt_id, p = save_attempt_and_update_progress(conn, attempt_dict)
+        unlocked = []
+        # Reglas de logros básicos
+        if p["current_streak"] >= 5:
+            ach = award_achievement(
+                conn,
+                attempt_dict["student_id"],
+                "streak_5",
+                "Racha 5",
+                "Alcanzaste una racha de 5 respuestas correctas.",
+            )
+            if ach:
+                unlocked.append(ach)
+        acc_pct = float(p.get("accuracy") or 0) * 100
+        if acc_pct >= 80 and p.get("total_attempts", 0) >= 10:
+            ach = award_achievement(
+                conn,
+                attempt_dict["student_id"],
+                "accuracy_80",
+                "Precisión 80%",
+                "Mantienes una precisión de 80% o más.",
+            )
+            if ach:
+                unlocked.append(ach)
+        # Meta diaria
+        try:
+            today_attempts = conn.execute(
+                text(
+                    """
+                    select count(*) from attempts
+                    where student_id = :sid and date(created_at) = current_date
+                    """
+                ),
+                {"sid": attempt_dict["student_id"]},
+            ).scalar() or 0
+            if today_attempts >= DAILY_GOAL:
+                ach = award_achievement(
+                    conn,
+                    attempt_dict["student_id"],
+                    "daily_goal",
+                    "Meta diaria",
+                    f"Completaste tu meta de {DAILY_GOAL} ejercicios hoy.",
+                )
+                if ach:
+                    unlocked.append(ach)
+        except Exception as exc:
+            logger.warning("daily goal check failed: %s", exc)
 
     # 5) Devolvemos el mismo formato que ya usabas para el progreso
     return {
@@ -761,6 +917,7 @@ async def post_attempt(request: Request):
             "best_streak": p["best_streak"],
             "last_answer_at": p["last_answer_at"].isoformat() if p["last_answer_at"] else None,
         },
+        "achievements_unlocked": unlocked,
     }
 
 @app.get("/progress", response_model=ProgressOut)
@@ -1124,6 +1281,29 @@ def report_summary(request: Request, sid: str):
         "time_avg_s": time_avg_s,
         "weak_skills": weak_skills,
     }
+
+
+@app.get("/students/{sid}/achievements")
+def list_achievements(sid: str, request: Request):
+    user = require_user(request, allowed_roles=["student", "teacher"])
+    if user["role"] == "student" and str(user["id"]) != sid:
+        raise HTTPException(status_code=403, detail="No autorizado")
+    with engine.begin() as conn:
+        rows = conn.execute(LIST_ACHIEVEMENTS_SQL, {"sid": sid}).mappings().all()
+    achievements = []
+    for r in rows:
+        earned_at = r.get("earned_at")
+        if isinstance(earned_at, (datetime, date)):
+            earned_at = earned_at.isoformat()
+        achievements.append(
+            {
+                "code": r["code"],
+                "title": r["title"],
+                "description": r["description"],
+                "earned_at": earned_at,
+            }
+        )
+    return {"achievements": achievements}
 
 @app.get("/db-check")
 def db_check():
