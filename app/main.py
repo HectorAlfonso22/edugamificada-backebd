@@ -202,6 +202,78 @@ def sanitize_user(row: dict) -> dict:
     }
 
 
+def build_strengths_fallback(accuracy: float, attempts: int, time_avg_s: float) -> List[str]:
+    strengths: List[str] = []
+    acc_pct = int(accuracy * 100)
+    if accuracy >= 0.8:
+        strengths.append(f"Precisión sólida ({acc_pct}%).")
+    elif accuracy >= 0.6:
+        strengths.append(f"Precisión aceptable ({acc_pct}%), sigue reforzando.")
+    if attempts >= 10:
+        strengths.append(f"Constancia: {attempts} intentos acumulados.")
+    if time_avg_s and time_avg_s <= 8:
+        strengths.append(f"Buen ritmo de respuesta ({time_avg_s}s).")
+    if not strengths:
+        strengths.append("Continúas practicando, sigue así.")
+    return strengths
+
+
+def band_from_age(age: Optional[int]) -> str:
+    if age is None:
+        return "B"
+    if age <= 7:
+        return "A"
+    if age <= 10:
+        return "B"
+    return "C"
+
+
+def clamp_band(band: str) -> str:
+    order = ["A", "B", "C"]
+    if band not in order:
+        return "B"
+    return band
+
+
+def adjust_band(base: str, acc_recent: Optional[float]) -> str:
+    if acc_recent is None:
+        return clamp_band(base)
+    order = ["A", "B", "C"]
+    idx = order.index(clamp_band(base))
+    if acc_recent < 0.4 and idx > 0:
+        idx -= 1
+    elif acc_recent > 0.8 and idx < len(order) - 1:
+        idx += 1
+    return order[idx]
+
+
+def recent_accuracy_by_subject(conn, student_id: str, subject: str) -> Optional[float]:
+    try:
+        acc = conn.execute(
+            text(
+                """
+                select avg(correct_val) as acc
+                from (
+                    select a.correct::int as correct_val
+                    from attempts a
+                    join items i on i.id = a.item_id
+                    where a.student_id = :sid
+                      and lower(trim(
+                          replace(replace(replace(replace(replace(i.subject,'á','a'),'é','e'),'í','i'),'ó','o'),'ú','u')
+                      )) = :subject
+                    order by a.created_at desc
+                    limit 10
+                ) as sub
+                """
+            ),
+            {"sid": student_id, "subject": subject},
+        ).scalar()
+        return float(acc) if acc is not None else None
+    except Exception as exc:
+        logger.warning("recent_accuracy query failed: %s", exc)
+        return None
+
+
 def generate_ai_summary(context: dict) -> Optional[dict]:
     if not openai_client:
         return None
@@ -239,14 +311,18 @@ def generate_ai_summary(context: dict) -> Optional[dict]:
         return content or ""
 
     prompt = f"""
-Eres un tutor educativo. Resume el progreso del alumno usando estos datos:
-Intentos: {context['attempts']}
-Precisión: {context['accuracy_percent']}%
-Tiempo promedio por pregunta (s): {context['time_avg_s']}
-Habilidades más débiles: {context['weak_list']}
+Eres un tutor educativo. Usa estos datos:
+- Intentos: {context['attempts']}
+- Precisión: {context['accuracy_percent']}%
+- Tiempo promedio (s): {context['time_avg_s']}
+- Habilidades más débiles: {context['weak_list']}
 
-Responde en JSON con las llaves: overview (string breve), strengths (lista de strings), focus (lista de strings).
-Sé concreto y amable.
+Devuelve SIEMPRE un JSON con:
+- overview: frase breve (1-2 líneas)
+- strengths: lista con al menos 2 fortalezas concretas (ej: "Precisión sólida", "Buen ritmo", "Constancia en intentos")
+- focus: lista con al menos 2 próximos pasos accionables (ej: "Practicar Sumas 0-20", "Repasar Restas 0-10")
+
+Sé conciso, positivo y específico.
 """
     models_to_try = [OPENAI_MODEL] if OPENAI_MODEL else []
     if "gpt-4o-mini" not in models_to_try:
@@ -461,6 +537,23 @@ def update_custom_question(question_id: int, payload: CustomQuestionPayload, req
     return {"question": {**row, "options": opts}}
 
 
+@app.delete("/teacher/questions/{question_id}")
+def delete_custom_question(question_id: int, request: Request):
+    teacher = require_user(request, allowed_roles=["teacher"])
+    with engine.begin() as conn:
+        existing = conn.execute(
+            SELECT_CUSTOM_ITEM_SQL, {"id": question_id}
+        ).mappings().first()
+        if not existing or str(existing["created_by"]) != str(teacher["id"]):
+            raise HTTPException(status_code=404, detail="Pregunta no encontrada")
+
+        conn.execute(
+            DELETE_CUSTOM_ITEM_SQL,
+            {"id": question_id, "teacher_id": str(teacher["id"])},
+        )
+    return {"deleted": True, "id": question_id}
+
+
 @app.get("/teacher/questions")
 def list_custom_questions(request: Request):
     teacher = require_user(request, allowed_roles=["teacher"])
@@ -488,6 +581,29 @@ def list_custom_questions(request: Request):
             }
         )
     return {"questions": questions}
+
+
+@app.get("/teacher/students")
+def list_students(request: Request):
+    teacher = require_user(request, allowed_roles=["teacher"])
+    _ = teacher  # lint
+    with engine.begin() as conn:
+        rows = conn.execute(LIST_STUDENTS_SQL).mappings().all()
+    students = []
+    for r in rows:
+        created_at = r.get("created_at")
+        if isinstance(created_at, (datetime, date)):
+            created_at = created_at.isoformat()
+        students.append(
+            {
+                "id": str(r["id"]),
+                "email": r["email"],
+                "display_name": r.get("display_name"),
+                "age": r.get("age"),
+                "created_at": created_at,
+            }
+        )
+    return {"students": students}
 
 
 # ---------------------------
@@ -550,6 +666,20 @@ SELECT_CUSTOM_ITEM_SQL = text(
     select id, subject, prompt, options, answer, created_by
     from custom_items
     where id = :id
+    """
+)
+DELETE_CUSTOM_ITEM_SQL = text(
+    """
+    delete from custom_items
+    where id = :id and created_by = :teacher_id
+    """
+)
+LIST_STUDENTS_SQL = text(
+    """
+    select id, email, display_name, age, created_at
+    from users
+    where role = 'student'
+    order by created_at asc
     """
 )
 LIST_CUSTOM_BY_CREATOR_SQL = text(
@@ -707,7 +837,8 @@ def next_items(
             i.options,
             i.answer,
             i.skill_id,
-            coalesce(m.p_mastery, 0.3) as mastery_score
+            coalesce(m.p_mastery, 0.3) as mastery_score,
+            i.difficulty
         from items i
         join skills s on s.id = i.skill_id
         left join mastery m on m.skill_id = i.skill_id and m.student_id = :student_id
@@ -716,13 +847,32 @@ def next_items(
         )) = :subject
     """
 
+    bands = None
+    if mode == "adaptive":
+        base_band = band_from_age(current.get("age"))
+        acc_recent = None
+        with engine.begin() as conn:
+            acc_recent = recent_accuracy_by_subject(conn, token_student_id, subj)
+        current_band = adjust_band(base_band, acc_recent)
+        bands = [current_band]
+        # Explora hacia arriba o abajo según desempeño
+        if current_band == "A":
+            bands.append("B")
+        elif current_band == "B":
+            bands.extend(["A", "C"])
+        else:
+            bands.append("B")
+
     if mode == "adaptive":
         sql = text(
             base_sql
             + """
+            {difficulty_filter}
             order by mastery_score asc, random()
             limit :k
-            """
+            """.format(
+                difficulty_filter="and (i.difficulty = ANY(:bands))" if bands else ""
+            )
         )
     else:
         sql = text(
@@ -735,7 +885,23 @@ def next_items(
 
     try:
         with engine.begin() as conn:
-            rows = conn.execute(sql, {"subject": subj, "k": k, "student_id": token_student_id}).mappings().all()
+            params = {"subject": subj, "k": k, "student_id": token_student_id}
+            if bands:
+                params["bands"] = bands
+            try:
+                rows = conn.execute(sql, params).mappings().all()
+            except Exception as exc:
+                logger.warning("Difficulty filter failed or missing column: %s. Falling back to random.", exc)
+                rows = conn.execute(
+                    text(
+                        base_sql
+                        + """
+                        order by random()
+                        limit :k
+                        """
+                    ),
+                    {"subject": subj, "k": k, "student_id": token_student_id},
+                ).mappings().all()
 
             # Fallback: si no encuentra para ese subject, trae cualquiera
             if not rows:
@@ -912,12 +1078,18 @@ def report_summary(request: Request, sid: str):
 
     ai_summary = generate_ai_summary(context)
     if ai_summary:
+        strengths = ai_summary.get("strengths") or []
+        if not strengths:
+            strengths = build_strengths_fallback(accuracy, attempts, time_avg_s)
+        focus = ai_summary.get("focus") or [w["name"] for w in weak_skills]
         return {
             **ai_summary,
             "attempts": attempts,
             "accuracy": accuracy,
             "time_avg_s": time_avg_s,
             "weak_skills": weak_skills,
+            "strengths": strengths,
+            "focus": focus,
         }
 
     strengths = []
