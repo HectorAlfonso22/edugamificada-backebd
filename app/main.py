@@ -391,6 +391,49 @@ Sé conciso, positivo y específico.
     return None
 
 
+def generate_ai_feedback(question: str, user_answer: str, correct_answer: str, subject: str) -> Optional[str]:
+    """Genera una retroalimentación breve y motivadora cuando la respuesta es incorrecta."""
+    if not openai_client:
+        return None
+
+    prompt = f"""
+Eres un docente amable y motivador. El alumno respondió mal a una pregunta.
+
+Pregunta: {question}
+Respuesta del alumno: {user_answer}
+Respuesta correcta: {correct_answer}
+Materia: {subject}
+
+Da una retroalimentación corta (1-2 oraciones) explicando:
+- por qué la opción del alumno no es correcta
+- cómo llegar a la respuesta correcta
+
+Sé positivo, evita sonar crítico y no incluyas la palabra 'incorrecto' al inicio.
+
+Responde solo con el texto de retroalimentación, sin encabezados ni formato extra.
+"""
+
+    models_to_try = [OPENAI_MODEL] if OPENAI_MODEL else []
+    if "gpt-4o-mini" not in models_to_try:
+        models_to_try.append("gpt-4o-mini")
+
+    for mdl in models_to_try:
+        try:
+            resp = openai_client.chat.completions.create(
+                model=mdl,
+                messages=[{"role": "user", "content": prompt}],
+                max_completion_tokens=120,
+                timeout=20,
+            )
+            raw = _extract_content(resp.choices[0]).strip()
+            if raw:
+                return raw
+        except Exception as exc:
+            logger.error("AI feedback failed with model %s: %s", mdl, exc)
+
+    return None
+
+
 def _cache_key_for_items(subject: str, k: int, age: Optional[int], band: str, weak_skills: Optional[List[str]]) -> str:
     weak_norm = ",".join(sorted([w.strip().lower() for w in (weak_skills or []) if w]))
     return f"{subject}|{k}|{age or 'unk'}|{band}|{weak_norm}"
@@ -1086,6 +1129,7 @@ async def post_attempt(request: Request):
         "time_ms": body.get("time_ms", 0),
         "hints_used": body.get("hints_used", 0),
         "subject": body.get("subject"),  # puede venir vacío
+        "prompt": body.get("prompt"),
     }
 
     # Validación mínima
@@ -1158,6 +1202,19 @@ async def post_attempt(request: Request):
         except Exception as exc:
             logger.warning("daily goal check failed: %s", exc)
 
+    feedback_msg = None
+    if not attempt_dict.get("is_correct"):
+        # Generar retroalimentación personalizada usando AI (si está configurado)
+        try:
+            feedback_msg = generate_ai_feedback(
+                question=str(attempt_dict.get("prompt") or ""),
+                user_answer=str(attempt_dict.get("response") or ""),
+                correct_answer=str(body.get("correct_answer") or body.get("answer") or ""),
+                subject=str(attempt_dict.get("subject") or ""),
+            )
+        except Exception as exc:
+            logger.warning("AI feedback generation failed: %s", exc)
+
     # 5) Devolvemos el mismo formato que ya usabas para el progreso
     return {
         "id": attempt_id,
@@ -1175,6 +1232,7 @@ async def post_attempt(request: Request):
             "last_answer_at": p["last_answer_at"].isoformat() if p["last_answer_at"] else None,
         },
         "achievements_unlocked": unlocked,
+        "feedback": feedback_msg,
     }
 
 @app.get("/progress", response_model=ProgressOut)
