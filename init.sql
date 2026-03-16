@@ -68,6 +68,18 @@ CREATE TABLE IF NOT EXISTS student_progress (
   PRIMARY KEY (student_id, subject)
 );
 
+-- 7) Historial de preguntas generadas por IA (para evitar repeticiones)
+CREATE TABLE IF NOT EXISTS ai_history (
+  id BIGSERIAL PRIMARY KEY,
+  student_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  subject TEXT NOT NULL,
+  prompt TEXT NOT NULL,
+  correct BOOLEAN NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_ai_history_student_subject ON ai_history (student_id, subject);
+
 -- 7) Logros
 CREATE TABLE IF NOT EXISTS achievements (
   id BIGSERIAL PRIMARY KEY,

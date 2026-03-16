@@ -121,6 +121,7 @@ def save_attempt_and_update_progress(conn, attempt: dict):
       - response (str o dict)
       - time_ms (int)
       - hints_used (int)
+      - prompt (str) [opcional] -> usado para evitar repetir preguntas generadas por IA
     """
 
     # --- Manejo seguro del campo response ---
@@ -154,6 +155,28 @@ def save_attempt_and_update_progress(conn, attempt: dict):
             "subject": attempt["subject"],
         },
     ).mappings().first()
+
+    # --- Si es intento de IA, guardamos la pregunta para evitar repetirla ---
+    prompt_text = attempt.get("prompt")
+    if prompt_text and attempt.get("item_id") and int(attempt.get("item_id")) < 0:
+        try:
+            conn.execute(
+                text(
+                    """
+                    insert into ai_history (student_id, subject, prompt, correct)
+                    values (:sid, :subject, :prompt, :correct)
+                    """
+                ),
+                {
+                    "sid": str(attempt["student_id"]),
+                    "subject": attempt["subject"],
+                    "prompt": str(prompt_text),
+                    "correct": bool(attempt["is_correct"]),
+                },
+            )
+        except Exception:
+            # no debe romper el flujo si el historial no se puede guardar
+            pass
 
     base = row or {
         "total_attempts": 0,

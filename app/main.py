@@ -4,6 +4,8 @@ import logging
 import os
 import random
 import socket
+import threading
+import time
 import uuid
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -95,6 +97,19 @@ CREATE_ACHIEVEMENTS_TABLE = text(
     """
 )
 
+CREATE_AI_HISTORY_TABLE = text(
+    """
+    create table if not exists ai_history (
+        id bigserial primary key,
+        student_id uuid not null references users(id) on delete cascade,
+        subject text not null,
+        prompt text not null,
+        correct boolean not null,
+        created_at timestamptz not null default now()
+    )
+    """
+)
+
 
 def ensure_custom_tables():
     try:
@@ -102,6 +117,7 @@ def ensure_custom_tables():
             conn.execute(CREATE_CUSTOM_ITEMS_TABLE)
             conn.execute(CREATE_CUSTOM_ITEMS_INDEX)
             conn.execute(CREATE_ACHIEVEMENTS_TABLE)
+            conn.execute(CREATE_AI_HISTORY_TABLE)
         logger.info("custom_items table ready")
     except Exception as exc:
         logger.error("Failed to ensure custom_items table: %s", exc)
@@ -122,6 +138,13 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 logger.info("OpenAI client configured: %s", bool(openai_client))
+
+# Cache simple en memoria para evitar llamar a la IA repetidamente con los mismos parámetros
+_AI_ITEMS_CACHE: dict = {}
+_CACHE_LOCK = threading.Lock()
+_CACHE_TTL_SECONDS = 90
+_CACHE_MAX_ENTRIES = 50
+
 DAILY_GOAL = int(os.getenv("DAILY_GOAL", "10"))
 
 # ---------------------------
@@ -368,17 +391,51 @@ Sé conciso, positivo y específico.
     return None
 
 
+def _cache_key_for_items(subject: str, k: int, age: Optional[int], band: str, weak_skills: Optional[List[str]]) -> str:
+    weak_norm = ",".join(sorted([w.strip().lower() for w in (weak_skills or []) if w]))
+    return f"{subject}|{k}|{age or 'unk'}|{band}|{weak_norm}"
+
+
+def _get_cached_items(key: str) -> Optional[List[dict]]:
+    now = time.time()
+    with _CACHE_LOCK:
+        entry = _AI_ITEMS_CACHE.get(key)
+        if not entry:
+            return None
+        if now - entry["ts"] > _CACHE_TTL_SECONDS:
+            del _AI_ITEMS_CACHE[key]
+            return None
+        return entry["items"]
+
+
+def _set_cached_items(key: str, items: List[dict]) -> None:
+    with _CACHE_LOCK:
+        if len(_AI_ITEMS_CACHE) >= _CACHE_MAX_ENTRIES:
+            # borrar el cache más viejo
+            oldest = min(_AI_ITEMS_CACHE.items(), key=lambda kv: kv[1]["ts"])[0]
+            del _AI_ITEMS_CACHE[oldest]
+        _AI_ITEMS_CACHE[key] = {"ts": time.time(), "items": items}
+
+
 def generate_ai_items(
     subject: str,
     k: int,
     age: Optional[int],
     band: str,
     student_context: Optional[dict] = None,
+    already_answered_prompts: Optional[List[str]] = None,
 ) -> List[dict]:
     """Genera k ejercicios usando OpenAI y devuelve items listos para el frontend."""
     if not openai_client:
         logger.warning("OpenAI client not configured - skipping AI item generation")
         return []
+
+    weak_skills = (student_context or {}).get("weak_skills") or []
+    cache_key = _cache_key_for_items(subject, k, age, band, weak_skills)
+    cached = _get_cached_items(cache_key)
+    if cached:
+        logger.info("Returning cached AI items for key=%s", cache_key)
+        return cached
 
     ctx_lines = []
     if student_context:
@@ -389,6 +446,17 @@ def generate_ai_items(
         ctx_lines.append(f"Intentos totales: {attempts}" if attempts is not None else "")
         if weak:
             ctx_lines.append(f"Habilidades débiles: {', '.join(weak)}")
+
+    extra_instructions = ""
+    if already_answered_prompts:
+        short_list = [p for p in already_answered_prompts if p]
+        if short_list:
+            summary = "; ".join(short_list[:10])
+            extra_instructions = (
+                "\n\nNO repitas preguntas ya respondidas correctamente. "
+                "Evita preguntas similares a: "
+                f"{summary}."
+            )
 
     prompt = f"""
 Eres un tutor educativo de primaria.
@@ -403,6 +471,7 @@ Contexto del estudiante:
 - Materia: {subject}
 - Banda de dificultad sugerida: {band}
 {''.join([f'- {l}\n' for l in ctx_lines if l])}
+{extra_instructions}
 
 IMPORTANTE:
 - Si la materia es "castellano", SOLO genera ejercicios de lengua (gramática, ortografía, lectura, vocabulario, comprensión). NO incluyas operaciones numéricas ni problemas matemáticos.
@@ -417,66 +486,88 @@ Ejemplo de salida:
 {{"items":[{{"prompt":"...","options":["...","..."],"answer":"..."}},{{"prompt":"...","options":[],"answer":"..."}}]}}
 """
 
-    try:
-        logger.info("Generating AI items (subject=%s, age=%s, band=%s, k=%s)", subject, age, band, k)
+    # Intentamos varias veces / con fallback de modelo para mayor resiliencia.
+    models_to_try = [OPENAI_MODEL or "gpt-4o-mini", "gpt-4o-mini"]
+    last_exception = None
 
-        resp = openai_client.chat.completions.create(
-            model=OPENAI_MODEL or "gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            max_completion_tokens=450,
-            response_format={"type": "json_object"},
-            timeout=30,
-        )
-
-        raw = _extract_content(resp.choices[0])
-        if raw and len(raw) > 1000:
-            logger.info("AI raw response (truncated): %s", raw[:1000])
-        else:
-            logger.info("AI raw response: %s", raw)
-
-        parsed = _parse_json_safely(raw)
-        if not parsed or not isinstance(parsed, dict):
-            logger.warning("AI items parse failed or returned non-dict: %r", parsed)
-            return []
-
-        items_raw = parsed.get("items") or []
-        if not isinstance(items_raw, list):
-            return []
-
-        results: List[dict] = []
-        base_id = -int(datetime.utcnow().timestamp() * 1000)
-        for idx, it in enumerate(items_raw):
-            if not isinstance(it, dict):
-                continue
-            prompt_text = str(it.get("prompt") or "").strip()
-            answer = str(it.get("answer") or "").strip()
-            opts = it.get("options") or []
-            if isinstance(opts, str):
-                try:
-                    opts = json.loads(opts)
-                except Exception:
-                    opts = []
-            if not isinstance(opts, list):
-                opts = []
-
-            results.append(
-                {
-                    "id": base_id - idx,
-                    "type": "ai",
-                    "prompt": prompt_text,
-                    "options": [str(o) for o in opts],
-                    "answer": answer,
-                    "subject": subject,
-                    "reason": "ia",
-                }
+    for model in models_to_try:
+        try:
+            logger.info(
+                "Generating AI items (model=%s subject=%s age=%s band=%s k=%s)",
+                model,
+                subject,
+                age,
+                band,
+                k,
             )
 
-        if not results:
-            logger.warning("AI items generation returned 0 results (parsed items length=%d)", len(items_raw))
-        return results
-    except Exception as exc:
-        logger.error("AI items generation failed: %s", exc)
-        return []
+            resp = openai_client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                max_completion_tokens=450,
+                response_format={"type": "json_object"},
+                timeout=30,
+            )
+
+            raw = _extract_content(resp.choices[0])
+            if raw and len(raw) > 1000:
+                logger.info("AI raw response (truncated): %s", raw[:1000])
+            else:
+                logger.info("AI raw response: %s", raw)
+
+            parsed = _parse_json_safely(raw)
+            if not parsed or not isinstance(parsed, dict):
+                logger.warning("AI items parse failed or returned non-dict: %r", parsed)
+                continue
+
+            items_raw = parsed.get("items") or []
+            if not isinstance(items_raw, list):
+                continue
+
+            results: List[dict] = []
+            base_id = -int(datetime.utcnow().timestamp() * 1000)
+            for idx, it in enumerate(items_raw):
+                if not isinstance(it, dict):
+                    continue
+                prompt_text = str(it.get("prompt") or "").strip()
+                answer = str(it.get("answer") or "").strip()
+                opts = it.get("options") or []
+                if isinstance(opts, str):
+                    try:
+                        opts = json.loads(opts)
+                    except Exception:
+                        opts = []
+                if not isinstance(opts, list):
+                    opts = []
+
+                results.append(
+                    {
+                        "id": base_id - idx,
+                        "type": "ai",
+                        "prompt": prompt_text,
+                        "options": [str(o) for o in opts],
+                        "answer": answer,
+                        "subject": subject,
+                        "reason": "ia",
+                    }
+                )
+
+            if results:
+                _set_cached_items(cache_key, results)
+                return results
+
+            logger.warning(
+                "AI items generation returned 0 results (parsed items length=%d) for model=%s",
+                len(items_raw),
+                model,
+            )
+        except Exception as exc:
+            last_exception = exc
+            logger.warning("AI items generation failed (model=%s): %s", model, exc)
+
+    if last_exception:
+        logger.error("AI generation failed after retries: %s", last_exception)
+    return []
 
 
 def generate_default_items(subject: str, k: int) -> List[dict]:
@@ -1222,9 +1313,27 @@ def next_items(
 
     # Obtener contexto del alumno para que la IA ajuste la dificultad
     student_ctx = {}
+    already_answered_prompts: List[str] = []
     try:
         with engine.begin() as conn:
             student_ctx = get_student_context(conn, token_student_id, subj)
+
+            # Obtener las últimas preguntas contestadas correctamente por IA para evitar repetirlas
+            rows_prompts = conn.execute(
+                text(
+                    """
+                    select prompt
+                    from ai_history
+                    where student_id = :sid
+                      and subject = :subject
+                      and correct = true
+                    order by created_at desc
+                    limit 20
+                    """
+                ),
+                {"sid": token_student_id, "subject": subj},
+            ).scalars().all()
+            already_answered_prompts = [str(r) for r in rows_prompts if r]
     except Exception as exc:
         logger.warning("Failed to get student context: %s", exc)
 
@@ -1235,6 +1344,7 @@ def next_items(
         age=current.get("age"),
         band=bands[0] if bands else "B",
         student_context=student_ctx,
+        already_answered_prompts=already_answered_prompts,
     )
 
     # 3) Fallback mínimo: si OpenAI falla, usamos la consulta antigua
