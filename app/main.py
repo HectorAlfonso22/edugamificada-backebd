@@ -41,7 +41,9 @@ if not logger.handlers:
     logger.addHandler(stream_handler)
 logger.propagate = False
 
-load_dotenv()  # Carga variables de entorno antes de leer DATABASE_URL
+# Carga variables de entorno antes de leer DATABASE_URL (carga explícita del .env en el backend)
+load_dotenv(BASE_DIR / ".env")
+logger.info("Loaded .env from %s", BASE_DIR / ".env")
 
 # ---------------------------
 # Configuración / Conexión DB
@@ -119,6 +121,7 @@ SubjectLiteral = Literal["castellano", "matematica"]
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+logger.info("OpenAI client configured: %s", bool(openai_client))
 DAILY_GOAL = int(os.getenv("DAILY_GOAL", "10"))
 
 # ---------------------------
@@ -290,41 +293,41 @@ def recent_accuracy_by_subject(conn, student_id: str, subject: str) -> Optional[
         return None
 
 
+def _parse_json_safely(raw: str) -> Optional[dict]:
+    try:
+        cleaned = raw.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.strip("`")
+            if cleaned.lower().startswith("json"):
+                cleaned = cleaned[4:].strip()
+        return json.loads(cleaned)
+    except Exception as exc:
+        logger.error("AI JSON parse failed: %s | raw=%r", exc, raw[:500])
+        return None
+
+
+def _extract_content(choice) -> str:
+    """Normaliza el contenido devuelto por la API de OpenAI (string o lista de partes)."""
+    msg = choice.message
+    content = getattr(msg, "content", "")
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict):
+                parts.append(part.get("text") or "")
+            else:
+                txt = getattr(part, "text", None)
+                if txt:
+                    parts.append(txt)
+        return "\n".join([p for p in parts if p])
+    return content or ""
+
+
 def generate_ai_summary(context: dict) -> Optional[dict]:
     if not openai_client:
         return None
-
-    def _parse_json_safely(raw: str) -> Optional[dict]:
-        try:
-            cleaned = raw.strip()
-            if cleaned.startswith("```"):
-                cleaned = cleaned.strip("`")
-                if cleaned.lower().startswith("json"):
-                    cleaned = cleaned[4:].strip()
-            return json.loads(cleaned)
-        except Exception as exc:
-            logger.error("AI summary JSON parse failed: %s | raw=%r", exc, raw[:500])
-            return None
-
-    def _extract_content(choice) -> str:
-        """
-        Normaliza el contenido devuelto por la API de OpenAI (string o lista de partes).
-        """
-        msg = choice.message
-        content = getattr(msg, "content", "")
-        if isinstance(content, list):
-            parts = []
-            for part in content:
-                if isinstance(part, str):
-                    parts.append(part)
-                elif isinstance(part, dict):
-                    parts.append(part.get("text") or "")
-                else:
-                    txt = getattr(part, "text", None)
-                    if txt:
-                        parts.append(txt)
-            return "\n".join([p for p in parts if p])
-        return content or ""
 
     prompt = f"""
 Eres un tutor educativo. Usa estos datos:
@@ -363,6 +366,169 @@ Sé conciso, positivo y específico.
             logger.error("AI summary failed with model %s: %s", mdl, exc)
 
     return None
+
+
+def generate_ai_items(
+    subject: str,
+    k: int,
+    age: Optional[int],
+    band: str,
+    student_context: Optional[dict] = None,
+) -> List[dict]:
+    """Genera k ejercicios usando OpenAI y devuelve items listos para el frontend."""
+    if not openai_client:
+        logger.warning("OpenAI client not configured - skipping AI item generation")
+        return []
+
+    ctx_lines = []
+    if student_context:
+        acc = student_context.get("accuracy")
+        attempts = student_context.get("attempts")
+        weak = student_context.get("weak_skills") or []
+        ctx_lines.append(f"Precision actual: {acc * 100:.0f}%" if acc is not None else "")
+        ctx_lines.append(f"Intentos totales: {attempts}" if attempts is not None else "")
+        if weak:
+            ctx_lines.append(f"Habilidades débiles: {', '.join(weak)}")
+
+    prompt = f"""
+Eres un tutor educativo de primaria.
+Genera exactamente un JSON válido con un arreglo llamado "items".
+Cada item debe tener:
+  - prompt: texto de la pregunta
+  - options: lista de opciones (puede ser [] para respuesta libre)
+  - answer: texto con la respuesta correcta
+
+Contexto del estudiante:
+- Edad: {age or 'desconocida'}
+- Materia: {subject}
+- Banda de dificultad sugerida: {band}
+{''.join([f'- {l}\n' for l in ctx_lines if l])}
+
+IMPORTANTE:
+- Si la materia es "castellano", SOLO genera ejercicios de lengua (gramática, ortografía, lectura, vocabulario, comprensión). NO incluyas operaciones numéricas ni problemas matemáticos.
+- Si la materia es "matematica", SOLO genera ejercicios de matemáticas (aritmética, lógica, problemas numéricos). NO incluyas preguntas de idioma.
+
+Haz {k} ejercicios.
+- Incluye al menos 1 ejercicio de opción múltiple y al menos 1 ejercicio de respuesta libre.
+- Prioriza fortalecer las habilidades débiles listadas, y ajusta la dificultad si el estudiante ya tiene buena precisión.
+
+Devuelve SOLO el JSON, sin texto adicional.
+Ejemplo de salida:
+{{"items":[{{"prompt":"...","options":["...","..."],"answer":"..."}},{{"prompt":"...","options":[],"answer":"..."}}]}}
+"""
+
+    try:
+        logger.info("Generating AI items (subject=%s, age=%s, band=%s, k=%s)", subject, age, band, k)
+
+        resp = openai_client.chat.completions.create(
+            model=OPENAI_MODEL or "gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            max_completion_tokens=450,
+            response_format={"type": "json_object"},
+            timeout=30,
+        )
+
+        raw = _extract_content(resp.choices[0])
+        if raw and len(raw) > 1000:
+            logger.info("AI raw response (truncated): %s", raw[:1000])
+        else:
+            logger.info("AI raw response: %s", raw)
+
+        parsed = _parse_json_safely(raw)
+        if not parsed or not isinstance(parsed, dict):
+            logger.warning("AI items parse failed or returned non-dict: %r", parsed)
+            return []
+
+        items_raw = parsed.get("items") or []
+        if not isinstance(items_raw, list):
+            return []
+
+        results: List[dict] = []
+        base_id = -int(datetime.utcnow().timestamp() * 1000)
+        for idx, it in enumerate(items_raw):
+            if not isinstance(it, dict):
+                continue
+            prompt_text = str(it.get("prompt") or "").strip()
+            answer = str(it.get("answer") or "").strip()
+            opts = it.get("options") or []
+            if isinstance(opts, str):
+                try:
+                    opts = json.loads(opts)
+                except Exception:
+                    opts = []
+            if not isinstance(opts, list):
+                opts = []
+
+            results.append(
+                {
+                    "id": base_id - idx,
+                    "type": "ai",
+                    "prompt": prompt_text,
+                    "options": [str(o) for o in opts],
+                    "answer": answer,
+                    "subject": subject,
+                    "reason": "ia",
+                }
+            )
+
+        if not results:
+            logger.warning("AI items generation returned 0 results (parsed items length=%d)", len(items_raw))
+        return results
+    except Exception as exc:
+        logger.error("AI items generation failed: %s", exc)
+        return []
+
+
+def generate_default_items(subject: str, k: int) -> List[dict]:
+    """Fallback muy básico cuando no hay datos en DB ni IA disponible."""
+    base_id = -int(datetime.utcnow().timestamp() * 1000)
+    items: List[dict] = []
+
+    if subject == "matematica":
+        items = [
+            {
+                "id": base_id,
+                "type": "fallback",
+                "prompt": "¿Cuánto es 2 + 3?",
+                "options": ["3", "4", "5", "6"],
+                "answer": "5",
+                "subject": subject,
+                "reason": "fallback",
+            },
+            {
+                "id": base_id - 1,
+                "type": "fallback",
+                "prompt": "Escribe el resultado de 7 + 4:",
+                "options": [],
+                "answer": "11",
+                "subject": subject,
+                "reason": "fallback",
+            },
+        ]
+    else:
+        items = [
+            {
+                "id": base_id,
+                "type": "fallback",
+                "prompt": "¿Cuál es la palabra correcta: 'casa' o 'cassa'?",
+                "options": ["casa", "cassa"],
+                "answer": "casa",
+                "subject": subject,
+                "reason": "fallback",
+            },
+            {
+                "id": base_id - 1,
+                "type": "fallback",
+                "prompt": "Escribe la palabra que falta: 'El gato es ____.'",
+                "options": [],
+                "answer": "negro",
+                "subject": subject,
+                "reason": "fallback",
+            },
+        ]
+
+    # Asegurar que devolvemos hasta k items.
+    return items[:k]
 
 
 def get_token_from_request(request: Request) -> str:
@@ -974,6 +1140,7 @@ def next_items(
             "next-items mismatch token %s vs query %s", token_student_id, student_id
         )
     logger.info("next-items requested by %s for %s (k=%s)", token_student_id, subject, k)
+
     # normalizar subject recibido
     subj = (
         subject.strip()
@@ -1004,6 +1171,40 @@ def next_items(
         )) = :subject
     """
 
+    def get_student_context(conn, student_id: str, subject: str) -> dict:
+        kpis = conn.execute(
+            text(
+                """
+                select
+                  count(*) as n,
+                  avg(case when correct then 1.0 else 0.0 end) as acc
+                from attempts
+                where student_id=:sid
+            """
+            ),
+            dict(sid=student_id),
+        ).mappings().one()
+
+        weak = conn.execute(
+            text(
+                """
+                select s.name, coalesce(m.p_mastery,0.2) as p
+                from skills s
+                left join mastery m on m.skill_id=s.id and m.student_id=:sid
+                order by p asc
+                limit 3
+                """
+            ),
+            dict(sid=student_id),
+        ).mappings().all()
+
+        return {
+            "attempts": int(kpis["n"] or 0),
+            "accuracy": float(kpis["acc"] or 0),
+            "weak_skills": [w["name"] for w in weak],
+        }
+
+    # Calcular los bands si estamos en modo adaptativo
     bands = None
     if mode == "adaptive":
         base_band = band_from_age(current.get("age"))
@@ -1012,7 +1213,6 @@ def next_items(
             acc_recent = recent_accuracy_by_subject(conn, token_student_id, subj)
         current_band = adjust_band(base_band, acc_recent)
         bands = [current_band]
-        # Explora hacia arriba o abajo según desempeño
         if current_band == "A":
             bands.append("B")
         elif current_band == "B":
@@ -1020,27 +1220,46 @@ def next_items(
         else:
             bands.append("B")
 
-    if mode == "adaptive":
-        sql = text(
-            base_sql
-            + """
-            {difficulty_filter}
-            order by mastery_score asc, random()
-            limit :k
-            """.format(
-                difficulty_filter="and (i.difficulty = ANY(:bands))" if bands else ""
-            )
-        )
-    else:
-        sql = text(
-            base_sql
-            + """
-            order by random()
-            limit :k
-            """
-        )
-
+    # Obtener contexto del alumno para que la IA ajuste la dificultad
+    student_ctx = {}
     try:
+        with engine.begin() as conn:
+            student_ctx = get_student_context(conn, token_student_id, subj)
+    except Exception as exc:
+        logger.warning("Failed to get student context: %s", exc)
+
+    # 2) Generar ejercicios con OpenAI
+    rows = generate_ai_items(
+        subject=subj,
+        k=k,
+        age=current.get("age"),
+        band=bands[0] if bands else "B",
+        student_context=student_ctx,
+    )
+
+    # 3) Fallback mínimo: si OpenAI falla, usamos la consulta antigua
+    custom_rows = []
+    if not rows:
+        if mode == "adaptive":
+            sql = text(
+                base_sql
+                + """
+                {difficulty_filter}
+                order by mastery_score asc, random()
+                limit :k
+                """.format(
+                    difficulty_filter="and (i.difficulty = ANY(:bands))" if bands else ""
+                )
+            )
+        else:
+            sql = text(
+                base_sql
+                + """
+                order by random()
+                limit :k
+                """
+            )
+
         with engine.begin() as conn:
             params = {"subject": subj, "k": k, "student_id": token_student_id}
             if bands:
@@ -1048,7 +1267,10 @@ def next_items(
             try:
                 rows = conn.execute(sql, params).mappings().all()
             except Exception as exc:
-                logger.warning("Difficulty filter failed or missing column: %s. Falling back to random.", exc)
+                logger.warning(
+                    "Difficulty filter failed or missing column: %s. Falling back to random.",
+                    exc,
+                )
                 rows = conn.execute(
                     text(
                         base_sql
@@ -1078,72 +1300,90 @@ def next_items(
                 )
                 rows = conn.execute(fallback_sql, {"k": k}).mappings().all()
 
-            custom_rows = []
             try:
                 custom_rows = conn.execute(
                     RANDOM_CUSTOM_ITEMS_SQL, {"subject": subj, "k": k}
                 ).mappings().all()
             except Exception as custom_exc:
                 logger.error("custom_items query failed: %s", custom_exc)
+    else:
+        try:
+            with engine.begin() as conn:
+                custom_rows = conn.execute(
+                    RANDOM_CUSTOM_ITEMS_SQL, {"subject": subj, "k": k}
+                ).mappings().all()
+        except Exception as custom_exc:
+            logger.error("custom_items query failed: %s", custom_exc)
 
-        items = []
-        for r in rows:
-            opts = r.get("options")
-            if isinstance(opts, str):
-                try:
-                    opts = json.loads(opts)
-                except Exception:
-                    opts = []
-            elif opts is None:
+    items = []
+    for r in rows:
+        opts = r.get("options")
+        if isinstance(opts, str):
+            try:
+                opts = json.loads(opts)
+            except Exception:
                 opts = []
+        elif opts is None:
+            opts = []
 
-            skill_id = r.get("skill_id")
-            skill_val = int(skill_id) if skill_id is not None else None
+        skill_id = r.get("skill_id")
+        skill_val = int(skill_id) if skill_id is not None else None
 
-            items.append(
-                {
-                    "id": int(r["id"]),
-                    "type": r.get("type"),
-                    "prompt": r.get("prompt"),
-                    "options": opts,
-                    "skill_id": skill_val,
-                    "answer": r.get("answer"),
-                    "subject": subj,
-                    "reason": "refuerzo" if mode == "adaptive" else "aleatorio",
-                }
-            )
+        items.append(
+            {
+                "id": int(r["id"]),
+                "type": r.get("type"),
+                "prompt": r.get("prompt"),
+                "options": opts,
+                "skill_id": skill_val,
+                "answer": r.get("answer"),
+                "subject": subj,
+                "reason": r.get("reason") or ("refuerzo" if mode == "adaptive" else "aleatorio"),
+            }
+        )
 
-        for r in custom_rows:
-            opts = r.get("options")
-            if isinstance(opts, str):
-                try:
-                    opts = json.loads(opts)
-                except Exception:
-                    opts = []
-            elif opts is None:
+    for r in custom_rows:
+        opts = r.get("options")
+        if isinstance(opts, str):
+            try:
+                opts = json.loads(opts)
+            except Exception:
                 opts = []
+        elif opts is None:
+            opts = []
 
-            items.append(
-                {
-                    "id": -int(r["id"]),
-                    "type": "custom",
-                    "prompt": r.get("prompt"),
-                    "options": opts,
-                    "skill_id": None,
-                    "answer": r.get("answer"),
-                    "subject": subj,
-                    "reason": "custom",
-                }
+        items.append(
+            {
+                "id": -int(r["id"]),
+                "type": "custom",
+                "prompt": r.get("prompt"),
+                "options": opts,
+                "skill_id": None,
+                "answer": r.get("answer"),
+                "subject": subj,
+                "reason": "custom",
+            }
+        )
+
+    if len(items) > k:
+        random.shuffle(items)
+        items = items[:k]
+
+    if not items:
+        # Como último recurso, proveemos un conjunto mínimo de ejercicios básicos
+        # para evitar que la app quede sin contenido si falta DB o la IA falla.
+        items = generate_default_items(subj, k)
+        if items:
+            logger.info(
+                "/next-items falling back to default items (subject=%s, mode=%s)",
+                subj,
+                mode,
             )
+        else:
+            logger.warning("/next-items returned 0 items (subject=%s, mode=%s)", subj, mode)
+            return {"items": [], "count": 0, "subject_used": subj, "error": "no_items"}
 
-        if len(items) > k:
-            random.shuffle(items)
-            items = items[:k]
-
-        return {"items": items, "count": len(items), "subject_used": subj}
-    except Exception as e:
-        logger.error("ERROR /next-items: %s", repr(e))
-        return {"items": [], "count": 0, "error": "fallback"}
+    return {"items": items, "count": len(items), "subject_used": subj}
 
 # ---------------------------
 # GET /reports/student/{sid}
