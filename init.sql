@@ -80,7 +80,25 @@ CREATE TABLE IF NOT EXISTS ai_history (
 
 CREATE INDEX IF NOT EXISTS idx_ai_history_student_subject ON ai_history (student_id, subject);
 
--- 7) Logros
+-- 8) Progreso por unidad curricular
+CREATE TABLE IF NOT EXISTS student_unit_progress (
+  student_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  subject TEXT NOT NULL CHECK (subject IN ('matematica','castellano')),
+  unit_key TEXT NOT NULL,
+  unit_name TEXT NOT NULL,
+  total_attempts INT NOT NULL DEFAULT 0,
+  correct_attempts INT NOT NULL DEFAULT 0,
+  accuracy NUMERIC NOT NULL DEFAULT 0,
+  p_mastery NUMERIC NOT NULL DEFAULT 0.30,
+  last_answer_at TIMESTAMPTZ,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (student_id, subject, unit_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_student_unit_progress_subject
+ON student_unit_progress (student_id, subject, p_mastery);
+
+-- 9) Logros
 CREATE TABLE IF NOT EXISTS achievements (
   id BIGSERIAL PRIMARY KEY,
   student_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -91,7 +109,7 @@ CREATE TABLE IF NOT EXISTS achievements (
   UNIQUE (student_id, code)
 );
 
--- 8) Ejercicios custom de docentes
+-- 10) Ejercicios custom de docentes
 CREATE TABLE IF NOT EXISTS custom_items (
   id BIGSERIAL PRIMARY KEY,
   subject TEXT NOT NULL CHECK (subject IN ('matematica','castellano')),

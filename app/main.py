@@ -110,6 +110,112 @@ CREATE_AI_HISTORY_TABLE = text(
     """
 )
 
+CREATE_STUDENT_UNIT_PROGRESS_TABLE = text(
+    """
+    create table if not exists student_unit_progress (
+        student_id uuid not null references users(id) on delete cascade,
+        subject text not null check (subject in ('matematica','castellano')),
+        unit_key text not null,
+        unit_name text not null,
+        total_attempts int not null default 0,
+        correct_attempts int not null default 0,
+        accuracy numeric not null default 0,
+        p_mastery numeric not null default 0.30,
+        last_answer_at timestamptz,
+        updated_at timestamptz not null default now(),
+        primary key (student_id, subject, unit_key)
+    )
+    """
+)
+CREATE_STUDENT_UNIT_PROGRESS_INDEX = text(
+    """
+    create index if not exists idx_student_unit_progress_subject
+        on student_unit_progress (student_id, subject, p_mastery)
+    """
+)
+
+CURRICULUM_UNITS = {
+    "matematica": [
+        {
+            "key": "operaciones_naturales",
+            "name": "Operaciones Naturales",
+            "contents": [
+                "Lectura y escritura de numeros naturales hasta 100000",
+                "Valor posicional, absoluto y relativo",
+                "Adicion y sustraccion con y sin reagrupacion",
+                "Multiplicacion por una y dos cifras y tablas del 2 al 9",
+                "Division por una y dos cifras",
+                "Sistema monetario en guaranies",
+            ],
+        },
+        {
+            "key": "geometria_y_medida",
+            "name": "Geometria y Medida",
+            "contents": [
+                "Triangulos y cuadrilateros",
+                "Perimetro de figuras regulares",
+                "Longitud: metro, decimetro y centimetro",
+                "Masa y capacidad: 1, 1/2, 1/4 y 3/4 de kilogramo y litro",
+                "Tiempo: hora, minuto y segundo",
+            ],
+        },
+        {
+            "key": "estadistica",
+            "name": "Estadistica",
+            "contents": [
+                "Recoleccion sencilla de datos",
+                "Tablas de frecuencias absolutas",
+                "Graficos de barras horizontales",
+            ],
+        },
+    ],
+    "castellano": [
+        {
+            "key": "comprension_oral",
+            "name": "Comprension de Textos Orales",
+            "contents": [
+                "Interpretacion de ordenes, instrucciones y dialogos",
+                "Significado de palabras en contexto",
+                "Personajes, acciones, lugares, temas e ideas principales",
+                "Prediccion e inferencia",
+                "Hechos posibles e imaginarios",
+            ],
+        },
+        {
+            "key": "expresion_oral",
+            "name": "Expresion Oral",
+            "contents": [
+                "Saludos, presentaciones y despedidas",
+                "Rimas, canciones y descripciones",
+                "Opiniones fundamentadas",
+                "Dramatizacion de fabulas, leyendas y cuentos",
+            ],
+        },
+        {
+            "key": "comprension_escrita",
+            "name": "Comprension de Textos Escritos",
+            "contents": [
+                "Prediccion de contenido",
+                "Secuencia de hechos e inicio, desarrollo y final",
+                "Abreviaturas, simbolos y siglas",
+                "Figuras literarias basicas",
+                "Lectura oral con fluidez",
+            ],
+        },
+        {
+            "key": "expresion_escrita",
+            "name": "Expresion Escrita",
+            "contents": [
+                "Esquelas, cartas familiares, historietas, avisos y narraciones breves",
+                "Mayusculas, puntuacion y acentuacion",
+                "Palabras agudas, llanas y esdrujulas",
+                "Concordancia de genero y numero",
+                "Tiempos verbales",
+            ],
+        },
+    ],
+}
+
 
 def ensure_custom_tables():
     try:
@@ -118,6 +224,8 @@ def ensure_custom_tables():
             conn.execute(CREATE_CUSTOM_ITEMS_INDEX)
             conn.execute(CREATE_ACHIEVEMENTS_TABLE)
             conn.execute(CREATE_AI_HISTORY_TABLE)
+            conn.execute(CREATE_STUDENT_UNIT_PROGRESS_TABLE)
+            conn.execute(CREATE_STUDENT_UNIT_PROGRESS_INDEX)
         logger.info("custom_items table ready")
     except Exception as exc:
         logger.error("Failed to ensure custom_items table: %s", exc)
@@ -258,6 +366,119 @@ def build_strengths_fallback(accuracy: float, attempts: int, time_avg_s: float) 
     if not strengths:
         strengths.append("Continúas practicando, sigue así.")
     return strengths
+
+
+def get_curriculum_units(subject: str) -> List[dict]:
+    return CURRICULUM_UNITS.get(subject, [])
+
+
+def curriculum_units_prompt(subject: str) -> str:
+    units = get_curriculum_units(subject)
+    lines: List[str] = []
+    for unit in units:
+        contents = ", ".join(unit.get("contents") or [])
+        lines.append(f"- {unit['key']}: {unit['name']} ({contents})")
+    return "\n".join(lines)
+
+
+def valid_unit_keys(subject: str) -> set[str]:
+    return {str(unit["key"]) for unit in get_curriculum_units(subject)}
+
+
+def find_unit_name(subject: str, unit_key: Optional[str]) -> Optional[str]:
+    if not unit_key:
+        return None
+    for unit in get_curriculum_units(subject):
+        if unit["key"] == unit_key:
+            return str(unit["name"])
+    return None
+
+
+def update_student_unit_progress(
+    conn,
+    student_id: str,
+    subject: str,
+    unit_key: Optional[str],
+    is_correct: bool,
+    last_answer_at,
+):
+    if not unit_key:
+        return
+
+    unit_name = find_unit_name(subject, unit_key)
+    if not unit_name:
+        return
+
+    row = conn.execute(
+        text(
+            """
+            select total_attempts, correct_attempts, accuracy, p_mastery
+            from student_unit_progress
+            where student_id = :sid and subject = :subject and unit_key = :unit_key
+            """
+        ),
+        {"sid": student_id, "subject": subject, "unit_key": unit_key},
+    ).mappings().first()
+
+    base_total = int((row or {}).get("total_attempts") or 0)
+    base_correct = int((row or {}).get("correct_attempts") or 0)
+    base_mastery = float((row or {}).get("p_mastery") or 0.30)
+
+    total_attempts = base_total + 1
+    correct_attempts = base_correct + (1 if is_correct else 0)
+    accuracy = correct_attempts / total_attempts if total_attempts else 0.0
+    p_mastery = bkt_update(base_mastery, is_correct)
+
+    conn.execute(
+        text(
+            """
+            insert into student_unit_progress (
+                student_id,
+                subject,
+                unit_key,
+                unit_name,
+                total_attempts,
+                correct_attempts,
+                accuracy,
+                p_mastery,
+                last_answer_at,
+                updated_at
+            )
+            values (
+                :sid,
+                :subject,
+                :unit_key,
+                :unit_name,
+                :total_attempts,
+                :correct_attempts,
+                :accuracy,
+                :p_mastery,
+                :last_answer_at,
+                now()
+            )
+            on conflict (student_id, subject, unit_key) do update
+            set
+                unit_name = excluded.unit_name,
+                total_attempts = excluded.total_attempts,
+                correct_attempts = excluded.correct_attempts,
+                accuracy = excluded.accuracy,
+                p_mastery = excluded.p_mastery,
+                last_answer_at = excluded.last_answer_at,
+                updated_at = now()
+            """
+        ),
+        {
+            "sid": student_id,
+            "subject": subject,
+            "unit_key": unit_key,
+            "unit_name": unit_name,
+            "total_attempts": total_attempts,
+            "correct_attempts": correct_attempts,
+            "accuracy": accuracy,
+            "p_mastery": p_mastery,
+            "last_answer_at": last_answer_at,
+        },
+    )
 
 
 def band_from_age(age: Optional[int]) -> str:
@@ -434,9 +655,17 @@ Responde solo con el texto de retroalimentación, sin encabezados ni formato ext
     return None
 
 
-def _cache_key_for_items(subject: str, k: int, age: Optional[int], band: str, weak_skills: Optional[List[str]]) -> str:
+def _cache_key_for_items(
+    subject: str,
+    k: int,
+    age: Optional[int],
+    band: str,
+    weak_skills: Optional[List[str]],
+    weak_units: Optional[List[str]] = None,
+) -> str:
     weak_norm = ",".join(sorted([w.strip().lower() for w in (weak_skills or []) if w]))
-    return f"{subject}|{k}|{age or 'unk'}|{band}|{weak_norm}"
+    units_norm = ",".join(sorted([u.strip().lower() for u in (weak_units or []) if u]))
+    return f"{subject}|{k}|{age or 'unk'}|{band}|{weak_norm}|{units_norm}"
 
 
 def _get_cached_items(key: str) -> Optional[List[dict]]:
@@ -474,7 +703,12 @@ def generate_ai_items(
         return []
 
     weak_skills = (student_context or {}).get("weak_skills") or []
-    cache_key = _cache_key_for_items(subject, k, age, band, weak_skills)
+    weak_units = [
+        str(u.get("unit_key"))
+        for u in ((student_context or {}).get("weak_units") or [])
+        if isinstance(u, dict) and u.get("unit_key")
+    ]
+    cache_key = _cache_key_for_items(subject, k, age, band, weak_skills, weak_units)
     cached = _get_cached_items(cache_key)
     if cached:
         logger.info("Returning cached AI items for key=%s", cache_key)
@@ -485,10 +719,38 @@ def generate_ai_items(
         acc = student_context.get("accuracy")
         attempts = student_context.get("attempts")
         weak = student_context.get("weak_skills") or []
+        weak_units_ctx = student_context.get("weak_units") or []
+        strong_units_ctx = student_context.get("strong_units") or []
         ctx_lines.append(f"Precision actual: {acc * 100:.0f}%" if acc is not None else "")
         ctx_lines.append(f"Intentos totales: {attempts}" if attempts is not None else "")
         if weak:
             ctx_lines.append(f"Habilidades débiles: {', '.join(weak)}")
+        if weak_units_ctx:
+            ctx_lines.append(
+                "Unidades a fortalecer: "
+                + ", ".join(
+                    [
+                        f"{u.get('unit_name')} ({int(float(u.get('accuracy') or 0) * 100)}%)"
+                        for u in weak_units_ctx
+                        if u.get("unit_name")
+                    ]
+                )
+            )
+        if strong_units_ctx:
+            ctx_lines.append(
+                "Unidades dominadas: "
+                + ", ".join(
+                    [
+                        f"{u.get('unit_name')} ({int(float(u.get('accuracy') or 0) * 100)}%)"
+                        for u in strong_units_ctx
+                        if u.get("unit_name")
+                    ]
+                )
+            )
+
+    curriculum_prompt = curriculum_units_prompt(subject)
+    valid_keys = sorted(valid_unit_keys(subject))
+    valid_keys_text = ", ".join(valid_keys)
 
     extra_instructions = ""
     if already_answered_prompts:
@@ -508,6 +770,7 @@ Cada item debe tener:
   - prompt: texto de la pregunta
   - options: lista de opciones (puede ser [] para respuesta libre)
   - answer: texto con la respuesta correcta
+  - unit_key: una de las claves curriculares permitidas para la materia
 
 Contexto del estudiante:
 - Edad: {age or 'desconocida'}
@@ -516,17 +779,22 @@ Contexto del estudiante:
 {''.join([f'- {l}\n' for l in ctx_lines if l])}
 {extra_instructions}
 
+Unidades curriculares permitidas para {subject}:
+{curriculum_prompt}
+
 IMPORTANTE:
 - Si la materia es "castellano", SOLO genera ejercicios de lengua (gramática, ortografía, lectura, vocabulario, comprensión). NO incluyas operaciones numéricas ni problemas matemáticos.
 - Si la materia es "matematica", SOLO genera ejercicios de matemáticas (aritmética, lógica, problemas numéricos). NO incluyas preguntas de idioma.
+- Para cada ejercicio, asigna el unit_key correcto según la unidad curricular trabajada.
+- unit_key debe ser exactamente uno de estos valores: {valid_keys_text}
 
 Haz {k} ejercicios.
 - Incluye al menos 1 ejercicio de opción múltiple y al menos 1 ejercicio de respuesta libre.
-- Prioriza fortalecer las habilidades débiles listadas, y ajusta la dificultad si el estudiante ya tiene buena precisión.
+- Prioriza fortalecer las habilidades débiles y las unidades a reforzar listadas, y ajusta la dificultad si el estudiante ya tiene buena precisión.
 
 Devuelve SOLO el JSON, sin texto adicional.
 Ejemplo de salida:
-{{"items":[{{"prompt":"...","options":["...","..."],"answer":"..."}},{{"prompt":"...","options":[],"answer":"..."}}]}}
+{{"items":[{{"prompt":"...","options":["...","..."],"answer":"...","unit_key":"{valid_keys[0] if valid_keys else 'unidad'}"}},{{"prompt":"...","options":[],"answer":"...","unit_key":"{valid_keys[0] if valid_keys else 'unidad'}"}}]}}
 """
 
     # Intentamos varias veces / con fallback de modelo para mayor resiliencia.
@@ -574,6 +842,7 @@ Ejemplo de salida:
                     continue
                 prompt_text = str(it.get("prompt") or "").strip()
                 answer = str(it.get("answer") or "").strip()
+                unit_key = str(it.get("unit_key") or "").strip().lower()
                 opts = it.get("options") or []
                 if isinstance(opts, str):
                     try:
@@ -582,6 +851,9 @@ Ejemplo de salida:
                         opts = []
                 if not isinstance(opts, list):
                     opts = []
+                if unit_key not in valid_unit_keys(subject):
+                    unit_key = valid_keys[0] if valid_keys else ""
+                unit_name = find_unit_name(subject, unit_key)
 
                 results.append(
                     {
@@ -591,6 +863,8 @@ Ejemplo de salida:
                         "options": [str(o) for o in opts],
                         "answer": answer,
                         "subject": subject,
+                        "unit_key": unit_key or None,
+                        "unit_name": unit_name,
                         "reason": "ia",
                     }
                 )
@@ -1130,6 +1404,7 @@ async def post_attempt(request: Request):
         "hints_used": body.get("hints_used", 0),
         "subject": body.get("subject"),  # puede venir vacío
         "prompt": body.get("prompt"),
+        "unit_key": body.get("unit_key"),
     }
 
     # Validación mínima
@@ -1155,6 +1430,14 @@ async def post_attempt(request: Request):
 
         # 4) Guardamos intento + actualizamos progreso
         attempt_id, p = save_attempt_and_update_progress(conn, attempt_dict)
+        update_student_unit_progress(
+            conn,
+            student_id=attempt_dict["student_id"],
+            subject=str(attempt_dict["subject"]),
+            unit_key=str(attempt_dict.get("unit_key") or "").strip().lower() or None,
+            is_correct=bool(attempt_dict["is_correct"]),
+            last_answer_at=p.get("last_answer_at"),
+        )
         unlocked = []
         # Reglas de logros básicos
         if p["current_streak"] >= 5:
@@ -1325,14 +1608,15 @@ def next_items(
             text(
                 """
                 select
-                  count(*) as n,
-                  avg(case when correct then 1.0 else 0.0 end) as acc
-                from attempts
+                  total_attempts as n,
+                  accuracy as acc
+                from student_progress
                 where student_id=:sid
+                  and subject=:subject
             """
             ),
-            dict(sid=student_id),
-        ).mappings().one()
+            dict(sid=student_id, subject=subject),
+        ).mappings().first() or {"n": 0, "acc": 0}
 
         weak = conn.execute(
             text(
@@ -1340,17 +1624,66 @@ def next_items(
                 select s.name, coalesce(m.p_mastery,0.2) as p
                 from skills s
                 left join mastery m on m.skill_id=s.id and m.student_id=:sid
+                where lower(trim(
+                    replace(replace(replace(replace(replace(s.subject,'á','a'),'é','e'),'í','i'),'ó','o'),'ú','u')
+                )) = :subject
                 order by p asc
                 limit 3
                 """
             ),
-            dict(sid=student_id),
+            dict(sid=student_id, subject=subject),
+        ).mappings().all()
+
+        weak_units = conn.execute(
+            text(
+                """
+                select unit_key, unit_name, accuracy, p_mastery, total_attempts
+                from student_unit_progress
+                where student_id = :sid and subject = :subject
+                order by p_mastery asc, total_attempts desc, updated_at desc
+                limit 3
+                """
+            ),
+            dict(sid=student_id, subject=subject),
+        ).mappings().all()
+
+        strong_units = conn.execute(
+            text(
+                """
+                select unit_key, unit_name, accuracy, p_mastery, total_attempts
+                from student_unit_progress
+                where student_id = :sid and subject = :subject
+                order by p_mastery desc, total_attempts desc, updated_at desc
+                limit 2
+                """
+            ),
+            dict(sid=student_id, subject=subject),
         ).mappings().all()
 
         return {
             "attempts": int(kpis["n"] or 0),
             "accuracy": float(kpis["acc"] or 0),
             "weak_skills": [w["name"] for w in weak],
+            "weak_units": [
+                {
+                    "unit_key": str(w["unit_key"]),
+                    "unit_name": str(w["unit_name"]),
+                    "accuracy": float(w["accuracy"] or 0),
+                    "p_mastery": float(w["p_mastery"] or 0),
+                    "total_attempts": int(w["total_attempts"] or 0),
+                }
+                for w in weak_units
+            ],
+            "strong_units": [
+                {
+                    "unit_key": str(w["unit_key"]),
+                    "unit_name": str(w["unit_name"]),
+                    "accuracy": float(w["accuracy"] or 0),
+                    "p_mastery": float(w["p_mastery"] or 0),
+                    "total_attempts": int(w["total_attempts"] or 0),
+                }
+                for w in strong_units
+            ],
         }
 
     # Calcular los bands si estamos en modo adaptativo
@@ -1506,6 +1839,8 @@ def next_items(
                 "skill_id": skill_val,
                 "answer": r.get("answer"),
                 "subject": subj,
+                "unit_key": r.get("unit_key"),
+                "unit_name": r.get("unit_name"),
                 "reason": r.get("reason") or ("refuerzo" if mode == "adaptive" else "aleatorio"),
             }
         )
@@ -1529,6 +1864,8 @@ def next_items(
                 "skill_id": None,
                 "answer": r.get("answer"),
                 "subject": subj,
+                "unit_key": r.get("unit_key"),
+                "unit_name": r.get("unit_name"),
                 "reason": "custom",
             }
         )
@@ -1740,4 +2077,3 @@ def seed_check():
             order by 1
         """)).mappings().all()
     return {"by_subject": [{ "subject": r["subj"], "count": int(r["n"]) } for r in rows]}
-
