@@ -6,6 +6,7 @@ import random
 import socket
 import threading
 import time
+import unicodedata
 import uuid
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -394,6 +395,39 @@ def find_unit_name(subject: str, unit_key: Optional[str]) -> Optional[str]:
     return None
 
 
+def normalize_text_value(value: Optional[str]) -> str:
+    text = str(value or "").strip().lower()
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    cleaned: List[str] = []
+    prev_space = False
+    for ch in text:
+        if ch.isalnum():
+            cleaned.append(ch)
+            prev_space = False
+        else:
+            if not prev_space:
+                cleaned.append(" ")
+                prev_space = True
+    return " ".join("".join(cleaned).split())
+
+
+def parse_string_list(value) -> List[str]:
+    if isinstance(value, list):
+        return [str(v).strip() for v in value if str(v or "").strip()]
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return []
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                return [str(v).strip() for v in parsed if str(v or "").strip()]
+        except Exception:
+            return [raw]
+    return []
+
+
 def update_student_unit_progress(
     conn,
     student_id: str,
@@ -655,6 +689,122 @@ Responde solo con el texto de retroalimentación, sin encabezados ni formato ext
     return None
 
 
+def judge_castellano_response_with_ai(
+    question: str,
+    user_answer: str,
+    correct_answer: str,
+    accepted_answers: Optional[List[str]] = None,
+    rubric: Optional[str] = None,
+) -> Optional[dict]:
+    if not openai_client:
+        return None
+
+    accepted_text = ", ".join([a for a in (accepted_answers or []) if a]) or "ninguna"
+    prompt = f"""
+Evalua si la respuesta de un alumno de primaria en Castellano debe considerarse valida.
+
+Pregunta: {question}
+Respuesta del alumno: {user_answer}
+Respuesta ejemplo: {correct_answer}
+Otras respuestas aceptables: {accepted_text}
+Criterio adicional: {rubric or 'ninguno'}
+
+Reglas:
+- Acepta sinonimos, variantes correctas y respuestas semanticamente validas.
+- No aceptes respuestas sin sentido, con categoria gramatical incorrecta o que no respondan a la consigna.
+- Si la respuesta es valida aunque no coincida exactamente con la respuesta ejemplo, marca true.
+- Se estricto pero razonable para tercer grado.
+
+Devuelve SOLO JSON con:
+- is_correct: boolean
+- reason: explicacion breve
+"""
+
+    models_to_try = [OPENAI_MODEL] if OPENAI_MODEL else []
+    if "gpt-4o-mini" not in models_to_try:
+        models_to_try.append("gpt-4o-mini")
+
+    for mdl in models_to_try:
+        try:
+            resp = openai_client.chat.completions.create(
+                model=mdl,
+                messages=[{"role": "user", "content": prompt}],
+                max_completion_tokens=140,
+                response_format={"type": "json_object"},
+                timeout=20,
+            )
+            parsed = _parse_json_safely(_extract_content(resp.choices[0]))
+            if isinstance(parsed, dict) and isinstance(parsed.get("is_correct"), bool):
+                return {
+                    "is_correct": bool(parsed["is_correct"]),
+                    "reason": str(parsed.get("reason") or "").strip(),
+                }
+        except Exception as exc:
+            logger.error("AI castellano judge failed with model %s: %s", mdl, exc)
+
+    return None
+
+
+def evaluate_student_response(
+    subject: str,
+    prompt: str,
+    response: Optional[str],
+    correct_answer: Optional[str],
+    options: Optional[List[str]] = None,
+    evaluation_mode: Optional[str] = None,
+    accepted_answers: Optional[List[str]] = None,
+    rubric: Optional[str] = None,
+) -> dict:
+    response_text = str(response or "").strip()
+    correct_text = str(correct_answer or "").strip()
+    response_norm = normalize_text_value(response_text)
+    correct_norm = normalize_text_value(correct_text)
+
+    if not response_norm:
+        return {"is_correct": False, "reason": "Respuesta vacia."}
+
+    if response_norm and correct_norm:
+        response_num = response_norm.replace(" ", "")
+        correct_num = correct_norm.replace(" ", "")
+        if response_num.isdigit() and correct_num.isdigit():
+            return {"is_correct": response_num == correct_num, "reason": ""}
+
+    option_values = [normalize_text_value(opt) for opt in (options or []) if str(opt or "").strip()]
+    accepted = accepted_answers or []
+    accepted_norm = {
+        normalize_text_value(val)
+        for val in ([correct_text] + accepted)
+        if normalize_text_value(val)
+    }
+    mode = (evaluation_mode or "").strip().lower()
+    if not mode:
+        mode = "exact" if option_values else ("accepted_answers" if subject == "castellano" else "exact")
+
+    if response_norm == correct_norm:
+        return {"is_correct": True, "reason": ""}
+    if response_norm in accepted_norm:
+        return {"is_correct": True, "reason": ""}
+
+    if option_values:
+        return {"is_correct": False, "reason": ""}
+
+    if mode == "exact":
+        return {"is_correct": False, "reason": ""}
+
+    if mode in {"accepted_answers", "ai_judge"} and subject == "castellano":
+        judged = judge_castellano_response_with_ai(
+            question=prompt,
+            user_answer=response_text,
+            correct_answer=correct_text,
+            accepted_answers=accepted,
+            rubric=rubric,
+        )
+        if judged:
+            return judged
+
+    return {"is_correct": False, "reason": ""}
+
+
 def _cache_key_for_items(
     subject: str,
     k: int,
@@ -771,6 +921,9 @@ Cada item debe tener:
   - options: lista de opciones (puede ser [] para respuesta libre)
   - answer: texto con la respuesta correcta
   - unit_key: una de las claves curriculares permitidas para la materia
+  - evaluation_mode: "exact", "accepted_answers" o "ai_judge"
+  - accepted_answers: lista opcional de otras respuestas validas (usa [] si no aplica)
+  - rubric: criterio breve para evaluar la respuesta si no basta una sola solucion
 
 Contexto del estudiante:
 - Edad: {age or 'desconocida'}
@@ -787,6 +940,10 @@ IMPORTANTE:
 - Si la materia es "matematica", SOLO genera ejercicios de matemáticas (aritmética, lógica, problemas numéricos). NO incluyas preguntas de idioma.
 - Para cada ejercicio, asigna el unit_key correcto según la unidad curricular trabajada.
 - unit_key debe ser exactamente uno de estos valores: {valid_keys_text}
+- Si la pregunta tiene una unica respuesta objetiva o es de opcion multiple, usa evaluation_mode="exact".
+- Si la pregunta de Castellano admite varias palabras correctas razonables, usa evaluation_mode="accepted_answers" y llena accepted_answers con 3 a 6 variantes validas.
+- Si la pregunta de Castellano es abierta y requiere criterio semantico o gramatical mas amplio, usa evaluation_mode="ai_judge" y explica el criterio en rubric.
+- No uses "ai_judge" para matematica.
 
 Haz {k} ejercicios.
 - Incluye al menos 1 ejercicio de opción múltiple y al menos 1 ejercicio de respuesta libre.
@@ -794,7 +951,7 @@ Haz {k} ejercicios.
 
 Devuelve SOLO el JSON, sin texto adicional.
 Ejemplo de salida:
-{{"items":[{{"prompt":"...","options":["...","..."],"answer":"...","unit_key":"{valid_keys[0] if valid_keys else 'unidad'}"}},{{"prompt":"...","options":[],"answer":"...","unit_key":"{valid_keys[0] if valid_keys else 'unidad'}"}}]}}
+{{"items":[{{"prompt":"...","options":["...","..."],"answer":"...","unit_key":"{valid_keys[0] if valid_keys else 'unidad'}","evaluation_mode":"exact","accepted_answers":[],"rubric":""}},{{"prompt":"...","options":[],"answer":"...","unit_key":"{valid_keys[0] if valid_keys else 'unidad'}","evaluation_mode":"accepted_answers","accepted_answers":["...","..."],"rubric":"acepta adjetivos validos y coherentes con la oracion"}}]}}
 """
 
     # Intentamos varias veces / con fallback de modelo para mayor resiliencia.
@@ -843,6 +1000,9 @@ Ejemplo de salida:
                 prompt_text = str(it.get("prompt") or "").strip()
                 answer = str(it.get("answer") or "").strip()
                 unit_key = str(it.get("unit_key") or "").strip().lower()
+                evaluation_mode = str(it.get("evaluation_mode") or "").strip().lower()
+                accepted_answers = parse_string_list(it.get("accepted_answers"))
+                rubric = str(it.get("rubric") or "").strip()
                 opts = it.get("options") or []
                 if isinstance(opts, str):
                     try:
@@ -854,6 +1014,10 @@ Ejemplo de salida:
                 if unit_key not in valid_unit_keys(subject):
                     unit_key = valid_keys[0] if valid_keys else ""
                 unit_name = find_unit_name(subject, unit_key)
+                if evaluation_mode not in {"exact", "accepted_answers", "ai_judge"}:
+                    evaluation_mode = "exact" if opts else ("accepted_answers" if subject == "castellano" else "exact")
+                if subject != "castellano" and evaluation_mode == "ai_judge":
+                    evaluation_mode = "exact"
 
                 results.append(
                     {
@@ -865,6 +1029,9 @@ Ejemplo de salida:
                         "subject": subject,
                         "unit_key": unit_key or None,
                         "unit_name": unit_name,
+                        "evaluation_mode": evaluation_mode,
+                        "accepted_answers": accepted_answers,
+                        "rubric": rubric,
                         "reason": "ia",
                     }
                 )
@@ -901,6 +1068,9 @@ def generate_default_items(subject: str, k: int) -> List[dict]:
                 "options": ["3", "4", "5", "6"],
                 "answer": "5",
                 "subject": subject,
+                "evaluation_mode": "exact",
+                "accepted_answers": [],
+                "rubric": "",
                 "reason": "fallback",
             },
             {
@@ -910,6 +1080,9 @@ def generate_default_items(subject: str, k: int) -> List[dict]:
                 "options": [],
                 "answer": "11",
                 "subject": subject,
+                "evaluation_mode": "exact",
+                "accepted_answers": [],
+                "rubric": "",
                 "reason": "fallback",
             },
         ]
@@ -922,6 +1095,9 @@ def generate_default_items(subject: str, k: int) -> List[dict]:
                 "options": ["casa", "cassa"],
                 "answer": "casa",
                 "subject": subject,
+                "evaluation_mode": "exact",
+                "accepted_answers": [],
+                "rubric": "",
                 "reason": "fallback",
             },
             {
@@ -931,6 +1107,9 @@ def generate_default_items(subject: str, k: int) -> List[dict]:
                 "options": [],
                 "answer": "negro",
                 "subject": subject,
+                "evaluation_mode": "accepted_answers",
+                "accepted_answers": ["negra", "bonito", "bonita", "feliz", "pequeno", "pequeño"],
+                "rubric": "Acepta adjetivos validos y coherentes para describir al gato.",
                 "reason": "fallback",
             },
         ]
@@ -1405,14 +1584,16 @@ async def post_attempt(request: Request):
         "subject": body.get("subject"),  # puede venir vacío
         "prompt": body.get("prompt"),
         "unit_key": body.get("unit_key"),
+        "correct_answer": body.get("correct_answer") or body.get("answer"),
+        "options": body.get("options"),
+        "evaluation_mode": body.get("evaluation_mode"),
+        "accepted_answers": body.get("accepted_answers"),
+        "rubric": body.get("rubric"),
     }
 
     # Validación mínima
     if attempt_dict["item_id"] is None:
         raise HTTPException(status_code=400, detail="item_id es obligatorio")
-
-    if attempt_dict["is_correct"] is None:
-        raise HTTPException(status_code=400, detail="is_correct/correct es obligatorio")
 
     # 3) Si no vino subject en el body, lo resolvemos desde la tabla items
     with engine.begin() as conn:
@@ -1427,6 +1608,18 @@ async def post_attempt(request: Request):
                     detail="No se pudo resolver subject para ese item_id",
                 )
             attempt_dict["subject"] = row[0]
+
+        evaluation = evaluate_student_response(
+            subject=str(attempt_dict.get("subject") or ""),
+            prompt=str(attempt_dict.get("prompt") or ""),
+            response=str(attempt_dict.get("response") or ""),
+            correct_answer=str(attempt_dict.get("correct_answer") or ""),
+            options=parse_string_list(attempt_dict.get("options")),
+            evaluation_mode=str(attempt_dict.get("evaluation_mode") or ""),
+            accepted_answers=parse_string_list(attempt_dict.get("accepted_answers")),
+            rubric=str(attempt_dict.get("rubric") or ""),
+        )
+        attempt_dict["is_correct"] = bool(evaluation["is_correct"])
 
         # 4) Guardamos intento + actualizamos progreso
         attempt_id, p = save_attempt_and_update_progress(conn, attempt_dict)
@@ -1516,6 +1709,7 @@ async def post_attempt(request: Request):
         },
         "achievements_unlocked": unlocked,
         "feedback": feedback_msg,
+        "is_correct": bool(attempt_dict["is_correct"]),
     }
 
 @app.get("/progress", response_model=ProgressOut)
@@ -1841,6 +2035,9 @@ def next_items(
                 "subject": subj,
                 "unit_key": r.get("unit_key"),
                 "unit_name": r.get("unit_name"),
+                "evaluation_mode": r.get("evaluation_mode") or ("exact" if opts else ("accepted_answers" if subj == "castellano" else "exact")),
+                "accepted_answers": parse_string_list(r.get("accepted_answers")),
+                "rubric": r.get("rubric") or "",
                 "reason": r.get("reason") or ("refuerzo" if mode == "adaptive" else "aleatorio"),
             }
         )
@@ -1866,6 +2063,9 @@ def next_items(
                 "subject": subj,
                 "unit_key": r.get("unit_key"),
                 "unit_name": r.get("unit_name"),
+                "evaluation_mode": r.get("evaluation_mode") or ("exact" if opts else ("accepted_answers" if subj == "castellano" else "exact")),
+                "accepted_answers": parse_string_list(r.get("accepted_answers")),
+                "rubric": r.get("rubric") or "",
                 "reason": "custom",
             }
         )
