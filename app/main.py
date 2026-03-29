@@ -8,7 +8,7 @@ import threading
 import time
 import unicodedata
 import uuid
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Literal, Optional
 from uuid import UUID
@@ -71,6 +71,11 @@ CREATE_CUSTOM_ITEMS_TABLE = text(
         prompt text not null,
         options jsonb not null default '[]'::jsonb,
         answer text not null,
+        unit_key text,
+        difficulty text,
+        evaluation_mode text not null default 'exact',
+        accepted_answers jsonb not null default '[]'::jsonb,
+        rubric text,
         created_by uuid not null references users(id) on delete cascade,
         is_active boolean not null default true,
         created_at timestamptz not null default now()
@@ -82,6 +87,21 @@ CREATE_CUSTOM_ITEMS_INDEX = text(
     create index if not exists idx_custom_items_subject
         on custom_items (subject)
     """
+)
+ALTER_CUSTOM_ITEMS_ADD_UNIT_KEY = text(
+    "alter table custom_items add column if not exists unit_key text"
+)
+ALTER_CUSTOM_ITEMS_ADD_DIFFICULTY = text(
+    "alter table custom_items add column if not exists difficulty text"
+)
+ALTER_CUSTOM_ITEMS_ADD_EVAL_MODE = text(
+    "alter table custom_items add column if not exists evaluation_mode text not null default 'exact'"
+)
+ALTER_CUSTOM_ITEMS_ADD_ACCEPTED = text(
+    "alter table custom_items add column if not exists accepted_answers jsonb not null default '[]'::jsonb"
+)
+ALTER_CUSTOM_ITEMS_ADD_RUBRIC = text(
+    "alter table custom_items add column if not exists rubric text"
 )
 
 CREATE_ACHIEVEMENTS_TABLE = text(
@@ -132,6 +152,49 @@ CREATE_STUDENT_UNIT_PROGRESS_INDEX = text(
     """
     create index if not exists idx_student_unit_progress_subject
         on student_unit_progress (student_id, subject, p_mastery)
+    """
+)
+CREATE_TEACHER_ASSIGNMENTS_TABLE = text(
+    """
+    create table if not exists teacher_assignments (
+        id bigserial primary key,
+        teacher_id uuid not null references users(id) on delete cascade,
+        student_id uuid not null references users(id) on delete cascade,
+        subject text not null check (subject in ('matematica','castellano')),
+        unit_key text not null,
+        title text not null,
+        target_attempts int not null default 5,
+        difficulty text,
+        notes text,
+        status text not null default 'active',
+        completed_attempts int not null default 0,
+        last_progress_at timestamptz,
+        created_at timestamptz not null default now()
+    )
+    """
+)
+CREATE_TEACHER_ASSIGNMENTS_INDEX = text(
+    """
+    create index if not exists idx_teacher_assignments_student_subject
+        on teacher_assignments (student_id, subject, status, created_at desc)
+    """
+)
+CREATE_TEACHER_NOTES_TABLE = text(
+    """
+    create table if not exists teacher_notes (
+        id bigserial primary key,
+        teacher_id uuid not null references users(id) on delete cascade,
+        student_id uuid not null references users(id) on delete cascade,
+        note text not null,
+        created_at timestamptz not null default now(),
+        updated_at timestamptz not null default now()
+    )
+    """
+)
+CREATE_TEACHER_NOTES_INDEX = text(
+    """
+    create index if not exists idx_teacher_notes_student
+        on teacher_notes (student_id, updated_at desc)
     """
 )
 
@@ -222,11 +285,20 @@ def ensure_custom_tables():
     try:
         with engine.begin() as conn:
             conn.execute(CREATE_CUSTOM_ITEMS_TABLE)
+            conn.execute(ALTER_CUSTOM_ITEMS_ADD_UNIT_KEY)
+            conn.execute(ALTER_CUSTOM_ITEMS_ADD_DIFFICULTY)
+            conn.execute(ALTER_CUSTOM_ITEMS_ADD_EVAL_MODE)
+            conn.execute(ALTER_CUSTOM_ITEMS_ADD_ACCEPTED)
+            conn.execute(ALTER_CUSTOM_ITEMS_ADD_RUBRIC)
             conn.execute(CREATE_CUSTOM_ITEMS_INDEX)
             conn.execute(CREATE_ACHIEVEMENTS_TABLE)
             conn.execute(CREATE_AI_HISTORY_TABLE)
             conn.execute(CREATE_STUDENT_UNIT_PROGRESS_TABLE)
             conn.execute(CREATE_STUDENT_UNIT_PROGRESS_INDEX)
+            conn.execute(CREATE_TEACHER_ASSIGNMENTS_TABLE)
+            conn.execute(CREATE_TEACHER_ASSIGNMENTS_INDEX)
+            conn.execute(CREATE_TEACHER_NOTES_TABLE)
+            conn.execute(CREATE_TEACHER_NOTES_INDEX)
         logger.info("custom_items table ready")
     except Exception as exc:
         logger.error("Failed to ensure custom_items table: %s", exc)
@@ -305,6 +377,34 @@ class CustomQuestionPayload(BaseModel):
     prompt: str
     options: List[str]
     answer: str
+    unit_key: Optional[str] = None
+    difficulty: Optional[str] = None
+    evaluation_mode: Optional[str] = "exact"
+    accepted_answers: List[str] = []
+    rubric: Optional[str] = None
+
+
+class TeacherAssignmentPayload(BaseModel):
+    student_id: str
+    subject: SubjectLiteral
+    unit_key: str
+    title: str
+    target_attempts: int = 5
+    difficulty: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class TeacherNotePayload(BaseModel):
+    student_id: str
+    note: str
+
+
+class TeacherQuestionSuggestPayload(BaseModel):
+    subject: SubjectLiteral
+    unit_key: str
+    difficulty: Optional[str] = None
+    objective: Optional[str] = None
+    count: int = 3
 
 
 # ---------------------------
@@ -428,6 +528,18 @@ def parse_string_list(value) -> List[str]:
     return []
 
 
+def resolve_unit_name(subject: str, unit_key: Optional[str]) -> str:
+    return find_unit_name(subject, unit_key) or (unit_key or "Sin unidad")
+
+
+def mastery_label(value: float) -> str:
+    if value >= 0.8:
+        return "domina"
+    if value >= 0.55:
+        return "en progreso"
+    return "reforzar"
+
+
 def update_student_unit_progress(
     conn,
     student_id: str,
@@ -513,6 +625,53 @@ def update_student_unit_progress(
             "last_answer_at": last_answer_at,
         },
     )
+
+
+def update_assignment_progress(
+    conn,
+    student_id: str,
+    subject: str,
+    unit_key: Optional[str],
+    attempt_created_at,
+):
+    if not unit_key:
+        return
+
+    assignments = conn.execute(
+        text(
+            """
+            select id, target_attempts, completed_attempts
+            from teacher_assignments
+            where student_id = :sid
+              and subject = :subject
+              and unit_key = :unit_key
+              and status = 'active'
+            order by created_at asc
+            """
+        ),
+        {"sid": student_id, "subject": subject, "unit_key": unit_key},
+    ).mappings().all()
+
+    for assignment in assignments:
+        new_completed = int(assignment["completed_attempts"] or 0) + 1
+        new_status = "completed" if new_completed >= int(assignment["target_attempts"] or 0) else "active"
+        conn.execute(
+            text(
+                """
+                update teacher_assignments
+                set completed_attempts = :completed,
+                    status = :status,
+                    last_progress_at = :progress_at
+                where id = :id
+                """
+            ),
+            {
+                "completed": new_completed,
+                "status": new_status,
+                "progress_at": attempt_created_at,
+                "id": assignment["id"],
+            },
+        )
 
 
 def band_from_age(age: Optional[int]) -> str:
@@ -805,6 +964,78 @@ def evaluate_student_response(
     return {"is_correct": False, "reason": ""}
 
 
+def generate_teacher_question_suggestions(
+    subject: str,
+    unit_key: str,
+    difficulty: Optional[str],
+    objective: Optional[str],
+    count: int,
+) -> List[dict]:
+    if not openai_client:
+        return []
+
+    unit_name = resolve_unit_name(subject, unit_key)
+    prompt = f"""
+Eres un asistente para docentes de primaria.
+Genera exactamente un JSON con una lista "items" para que el profesor pueda revisar y guardar.
+
+Materia: {subject}
+Unidad: {unit_name} ({unit_key})
+Dificultad sugerida: {difficulty or 'media'}
+Objetivo pedagógico: {objective or 'reforzar contenidos clave del tercer grado'}
+Cantidad: {count}
+
+Cada item debe tener:
+- prompt
+- options
+- answer
+- evaluation_mode
+- accepted_answers
+- rubric
+
+Reglas:
+- Si es opción múltiple usa evaluation_mode="exact".
+- Si es respuesta abierta de Castellano con varias respuestas válidas, usa evaluation_mode="accepted_answers" o "ai_judge" cuando haga falta criterio.
+- Mantén el nivel adecuado para tercer grado.
+
+Devuelve solo JSON.
+"""
+    try:
+        resp = openai_client.chat.completions.create(
+            model=OPENAI_MODEL or "gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            max_completion_tokens=500,
+            response_format={"type": "json_object"},
+            timeout=30,
+        )
+        parsed = _parse_json_safely(_extract_content(resp.choices[0]))
+        items = parsed.get("items") if isinstance(parsed, dict) else []
+        if not isinstance(items, list):
+            return []
+        results = []
+        for item in items[:count]:
+            if not isinstance(item, dict):
+                continue
+            results.append(
+                {
+                    "prompt": str(item.get("prompt") or "").strip(),
+                    "options": parse_string_list(item.get("options")),
+                    "answer": str(item.get("answer") or "").strip(),
+                    "evaluation_mode": str(item.get("evaluation_mode") or "exact").strip().lower(),
+                    "accepted_answers": parse_string_list(item.get("accepted_answers")),
+                    "rubric": str(item.get("rubric") or "").strip(),
+                    "subject": subject,
+                    "unit_key": unit_key,
+                    "unit_name": unit_name,
+                    "difficulty": difficulty or "",
+                }
+            )
+        return [r for r in results if r["prompt"] and r["answer"]]
+    except Exception as exc:
+        logger.warning("teacher suggestion generation failed: %s", exc)
+        return []
+
+
 def _cache_key_for_items(
     subject: str,
     k: int,
@@ -846,6 +1077,8 @@ def generate_ai_items(
     band: str,
     student_context: Optional[dict] = None,
     already_answered_prompts: Optional[List[str]] = None,
+    target_unit_key: Optional[str] = None,
+    target_difficulty: Optional[str] = None,
 ) -> List[dict]:
     """Genera k ejercicios usando OpenAI y devuelve items listos para el frontend."""
     if not openai_client:
@@ -858,7 +1091,14 @@ def generate_ai_items(
         for u in ((student_context or {}).get("weak_units") or [])
         if isinstance(u, dict) and u.get("unit_key")
     ]
-    cache_key = _cache_key_for_items(subject, k, age, band, weak_skills, weak_units)
+    cache_key = _cache_key_for_items(
+        subject,
+        k,
+        age,
+        band,
+        weak_skills,
+        weak_units + ([target_unit_key] if target_unit_key else []),
+    ) + f"|{target_difficulty or ''}"
     cached = _get_cached_items(cache_key)
     if cached:
         logger.info("Returning cached AI items for key=%s", cache_key)
@@ -901,6 +1141,7 @@ def generate_ai_items(
     curriculum_prompt = curriculum_units_prompt(subject)
     valid_keys = sorted(valid_unit_keys(subject))
     valid_keys_text = ", ".join(valid_keys)
+    target_unit_name = resolve_unit_name(subject, target_unit_key) if target_unit_key else None
 
     extra_instructions = ""
     if already_answered_prompts:
@@ -929,6 +1170,8 @@ Contexto del estudiante:
 - Edad: {age or 'desconocida'}
 - Materia: {subject}
 - Banda de dificultad sugerida: {band}
+- Unidad prioritaria: {target_unit_name or 'ninguna'}
+- Dificultad prioritaria: {target_difficulty or 'ninguna'}
 {''.join([f'- {l}\n' for l in ctx_lines if l])}
 {extra_instructions}
 
@@ -940,6 +1183,8 @@ IMPORTANTE:
 - Si la materia es "matematica", SOLO genera ejercicios de matemáticas (aritmética, lógica, problemas numéricos). NO incluyas preguntas de idioma.
 - Para cada ejercicio, asigna el unit_key correcto según la unidad curricular trabajada.
 - unit_key debe ser exactamente uno de estos valores: {valid_keys_text}
+- Si se indica una unidad prioritaria, concentra la mayoría de los ejercicios en esa unidad.
+- Si se indica una dificultad prioritaria, respétala al redactar los ejercicios.
 - Si la pregunta tiene una unica respuesta objetiva o es de opcion multiple, usa evaluation_mode="exact".
 - Si la pregunta de Castellano admite varias palabras correctas razonables, usa evaluation_mode="accepted_answers" y llena accepted_answers con 3 a 6 variantes validas.
 - Si la pregunta de Castellano es abierta y requiere criterio semantico o gramatical mas amplio, usa evaluation_mode="ai_judge" y explica el criterio en rubric.
@@ -1261,27 +1506,38 @@ def update_student_age(payload: AgePayload, request: Request):
 @app.post("/teacher/questions")
 def create_custom_question(payload: CustomQuestionPayload, request: Request):
     teacher = require_user(request, allowed_roles=["teacher"])
-    if len(payload.options) < 2:
-        raise HTTPException(status_code=400, detail="Debes proveer al menos dos opciones")
-
     norm_options = [str(o).strip() for o in payload.options if str(o).strip()]
-    if not norm_options:
-        raise HTTPException(status_code=400, detail="Opciones inválidas")
+    accepted_answers = [str(v).strip() for v in payload.accepted_answers if str(v).strip()]
+    if norm_options and len(norm_options) < 2:
+        raise HTTPException(status_code=400, detail="Debes proveer al menos dos opciones")
+    if not payload.prompt.strip() or not payload.answer.strip():
+        raise HTTPException(status_code=400, detail="Completa enunciado y respuesta")
+    if payload.unit_key and payload.unit_key not in valid_unit_keys(payload.subject):
+        raise HTTPException(status_code=400, detail="Unidad inválida")
+    evaluation_mode = (payload.evaluation_mode or "exact").strip().lower()
+    if evaluation_mode not in {"exact", "accepted_answers", "ai_judge"}:
+        raise HTTPException(status_code=400, detail="Modo de evaluación inválido")
+    if payload.subject != "castellano" and evaluation_mode == "ai_judge":
+        raise HTTPException(status_code=400, detail="ai_judge solo aplica a Castellano")
 
-    options_json = json.dumps(norm_options, ensure_ascii=False)
     with engine.begin() as conn:
         row = conn.execute(
             INSERT_CUSTOM_ITEM_SQL,
             {
                 "subject": payload.subject,
                 "prompt": payload.prompt.strip(),
-                "options": options_json,
+                "options": json.dumps(norm_options, ensure_ascii=False),
                 "answer": payload.answer.strip(),
+                "unit_key": payload.unit_key,
+                "difficulty": payload.difficulty,
+                "evaluation_mode": evaluation_mode,
+                "accepted_answers": json.dumps(accepted_answers, ensure_ascii=False),
+                "rubric": (payload.rubric or "").strip() or None,
                 "created_by": str(teacher["id"]),
             },
         ).mappings().first()
 
-    return {"question": {**row, "options": norm_options}}
+    return {"question": {**row, "options": norm_options, "accepted_answers": accepted_answers}}
 
 
 @app.put("/teacher/questions/{question_id}")
@@ -1290,12 +1546,10 @@ def update_custom_question(question_id: int, payload: CustomQuestionPayload, req
         raise HTTPException(status_code=400, detail="ID inválido")
 
     teacher = require_user(request, allowed_roles=["teacher"])
-    if len(payload.options) < 2:
-        raise HTTPException(status_code=400, detail="Debes proveer al menos dos opciones")
-
     norm_options = [str(o).strip() for o in payload.options if str(o).strip()]
-    if not norm_options:
-        raise HTTPException(status_code=400, detail="Opciones inválidas")
+    accepted_answers = [str(v).strip() for v in payload.accepted_answers if str(v).strip()]
+    if norm_options and len(norm_options) < 2:
+        raise HTTPException(status_code=400, detail="Debes proveer al menos dos opciones")
 
     with engine.begin() as conn:
         existing = conn.execute(
@@ -1304,7 +1558,6 @@ def update_custom_question(question_id: int, payload: CustomQuestionPayload, req
         if not existing or str(existing["created_by"]) != str(teacher["id"]):
             raise HTTPException(status_code=404, detail="Pregunta no encontrada")
 
-        options_json = json.dumps(norm_options, ensure_ascii=False)
         row = conn.execute(
             UPDATE_CUSTOM_ITEM_SQL,
             {
@@ -1312,22 +1565,26 @@ def update_custom_question(question_id: int, payload: CustomQuestionPayload, req
                 "teacher_id": str(teacher["id"]),
                 "subject": payload.subject,
                 "prompt": payload.prompt.strip(),
-                "options": options_json,
+                "options": json.dumps(norm_options, ensure_ascii=False),
                 "answer": payload.answer.strip(),
+                "unit_key": payload.unit_key,
+                "difficulty": payload.difficulty,
+                "evaluation_mode": (payload.evaluation_mode or "exact").strip().lower(),
+                "accepted_answers": json.dumps(accepted_answers, ensure_ascii=False),
+                "rubric": (payload.rubric or "").strip() or None,
             },
         ).mappings().first()
 
     if not row:
         raise HTTPException(status_code=400, detail="No se pudo actualizar la pregunta")
 
-    opts = row.get("options")
-    if isinstance(opts, str):
-        try:
-            opts = json.loads(opts)
-        except json.JSONDecodeError:
-            opts = norm_options
-
-    return {"question": {**row, "options": opts}}
+    return {
+        "question": {
+            **row,
+            "options": parse_string_list(row.get("options")),
+            "accepted_answers": parse_string_list(row.get("accepted_answers")),
+        }
+    }
 
 
 @app.delete("/teacher/questions/{question_id}")
@@ -1370,6 +1627,11 @@ def list_custom_questions(request: Request):
                 "prompt": r["prompt"],
                 "options": opts,
                 "answer": r["answer"],
+                "unit_key": r.get("unit_key"),
+                "difficulty": r.get("difficulty"),
+                "evaluation_mode": r.get("evaluation_mode"),
+                "accepted_answers": parse_string_list(r.get("accepted_answers")),
+                "rubric": r.get("rubric"),
                 "created_at": r.get("created_at"),
             }
         )
@@ -1397,6 +1659,441 @@ def list_students(request: Request):
             }
         )
     return {"students": students}
+
+
+@app.get("/teacher/students/{sid}/unit-progress")
+def teacher_student_unit_progress(sid: str, request: Request):
+    require_user(request, allowed_roles=["teacher"])
+    with engine.begin() as conn:
+        rows = conn.execute(
+            text(
+                """
+                select subject, unit_key, unit_name, total_attempts, correct_attempts, accuracy, p_mastery, updated_at
+                from student_unit_progress
+                where student_id = :sid
+                order by subject, unit_name
+                """
+            ),
+            {"sid": sid},
+        ).mappings().all()
+    return {
+        "units": [
+            {
+                "subject": r["subject"],
+                "unit_key": r["unit_key"],
+                "unit_name": r["unit_name"],
+                "total_attempts": int(r["total_attempts"] or 0),
+                "correct_attempts": int(r["correct_attempts"] or 0),
+                "accuracy": float(r["accuracy"] or 0),
+                "p_mastery": float(r["p_mastery"] or 0),
+                "status": mastery_label(float(r["p_mastery"] or 0)),
+                "updated_at": r["updated_at"].isoformat() if r.get("updated_at") else None,
+            }
+            for r in rows
+        ]
+    }
+
+
+@app.get("/teacher/students/{sid}/errors")
+def teacher_student_errors(sid: str, request: Request, limit: int = Query(10, ge=1, le=50)):
+    require_user(request, allowed_roles=["teacher"])
+    with engine.begin() as conn:
+        rows = conn.execute(
+            text(
+                """
+                select
+                  a.created_at,
+                  a.answer_text,
+                  a.item_id,
+                  coalesce(i.subject, c.subject, h.subject) as subject,
+                  coalesce(i.prompt, c.prompt, h.prompt) as prompt
+                from attempts a
+                left join items i
+                  on a.item_id > 0 and i.id = a.item_id
+                left join custom_items c
+                  on a.item_id < 0 and c.id = abs(a.item_id)
+                left join lateral (
+                    select ah.subject, ah.prompt
+                    from ai_history ah
+                    where ah.student_id = a.student_id
+                      and ah.correct = false
+                      and abs(extract(epoch from (ah.created_at - a.created_at))) <= 120
+                    order by abs(extract(epoch from (ah.created_at - a.created_at))) asc
+                    limit 1
+                ) h on a.item_id < 0
+                where a.student_id = :sid
+                  and a.correct = false
+                order by a.created_at desc
+                limit :limit
+                """
+            ),
+            {"sid": sid, "limit": limit},
+        ).mappings().all()
+    return {
+        "errors": [
+            {
+                "created_at": r["created_at"].isoformat() if r.get("created_at") else None,
+                "answer_text": r.get("answer_text"),
+                "item_id": int(r["item_id"] or 0),
+                "subject": r.get("subject"),
+                "prompt": r.get("prompt"),
+            }
+            for r in rows
+        ]
+    }
+
+
+@app.get("/teacher/notes")
+def list_teacher_notes(request: Request, student_id: Optional[str] = None):
+    teacher = require_user(request, allowed_roles=["teacher"])
+    with engine.begin() as conn:
+        rows = conn.execute(
+            text(
+                """
+                select n.id, n.student_id, n.note, n.created_at, n.updated_at, u.display_name, u.email
+                from teacher_notes n
+                join users u on u.id = n.student_id
+                where n.teacher_id = :teacher_id
+                  and (:student_id is null or n.student_id = cast(:student_id as uuid))
+                order by n.updated_at desc
+                """
+            ),
+            {"teacher_id": str(teacher["id"]), "student_id": student_id},
+        ).mappings().all()
+    return {
+        "notes": [
+            {
+                "id": int(r["id"]),
+                "student_id": str(r["student_id"]),
+                "student_name": r.get("display_name") or r.get("email"),
+                "note": r["note"],
+                "created_at": r["created_at"].isoformat() if r.get("created_at") else None,
+                "updated_at": r["updated_at"].isoformat() if r.get("updated_at") else None,
+            }
+            for r in rows
+        ]
+    }
+
+
+@app.post("/teacher/notes")
+def create_teacher_note(payload: TeacherNotePayload, request: Request):
+    teacher = require_user(request, allowed_roles=["teacher"])
+    with engine.begin() as conn:
+        row = conn.execute(
+            text(
+                """
+                insert into teacher_notes (teacher_id, student_id, note)
+                values (:teacher_id, cast(:student_id as uuid), :note)
+                returning id, student_id, note, created_at, updated_at
+                """
+            ),
+            {
+                "teacher_id": str(teacher["id"]),
+                "student_id": payload.student_id,
+                "note": payload.note.strip(),
+            },
+        ).mappings().first()
+    return {
+        "note": {
+            "id": int(row["id"]),
+            "student_id": str(row["student_id"]),
+            "note": row["note"],
+            "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
+            "updated_at": row["updated_at"].isoformat() if row.get("updated_at") else None,
+        }
+    }
+
+
+@app.get("/teacher/assignments")
+def list_teacher_assignments(request: Request, student_id: Optional[str] = None):
+    teacher = require_user(request, allowed_roles=["teacher"])
+    with engine.begin() as conn:
+        rows = conn.execute(
+            text(
+                """
+                select a.*, u.display_name, u.email
+                from teacher_assignments a
+                join users u on u.id = a.student_id
+                where a.teacher_id = :teacher_id
+                  and (:student_id is null or a.student_id = cast(:student_id as uuid))
+                order by a.created_at desc
+                """
+            ),
+            {"teacher_id": str(teacher["id"]), "student_id": student_id},
+        ).mappings().all()
+    return {
+        "assignments": [
+            {
+                "id": int(r["id"]),
+                "student_id": str(r["student_id"]),
+                "student_name": r.get("display_name") or r.get("email"),
+                "subject": r["subject"],
+                "unit_key": r["unit_key"],
+                "unit_name": resolve_unit_name(r["subject"], r["unit_key"]),
+                "title": r["title"],
+                "target_attempts": int(r["target_attempts"] or 0),
+                "completed_attempts": int(r["completed_attempts"] or 0),
+                "difficulty": r.get("difficulty"),
+                "notes": r.get("notes"),
+                "status": r["status"],
+                "created_at": r["created_at"].isoformat() if r.get("created_at") else None,
+                "last_progress_at": r["last_progress_at"].isoformat() if r.get("last_progress_at") else None,
+            }
+            for r in rows
+        ]
+    }
+
+
+@app.post("/teacher/assignments")
+def create_teacher_assignment(payload: TeacherAssignmentPayload, request: Request):
+    teacher = require_user(request, allowed_roles=["teacher"])
+    if payload.unit_key not in valid_unit_keys(payload.subject):
+        raise HTTPException(status_code=400, detail="Unidad inválida")
+    with engine.begin() as conn:
+        row = conn.execute(
+            text(
+                """
+                insert into teacher_assignments (
+                    teacher_id, student_id, subject, unit_key, title, target_attempts, difficulty, notes
+                )
+                values (
+                    :teacher_id, cast(:student_id as uuid), :subject, :unit_key, :title, :target_attempts, :difficulty, :notes
+                )
+                returning id, student_id, subject, unit_key, title, target_attempts, completed_attempts, difficulty, notes, status, created_at
+                """
+            ),
+            {
+                "teacher_id": str(teacher["id"]),
+                "student_id": payload.student_id,
+                "subject": payload.subject,
+                "unit_key": payload.unit_key,
+                "title": payload.title.strip(),
+                "target_attempts": max(1, int(payload.target_attempts or 1)),
+                "difficulty": payload.difficulty,
+                "notes": (payload.notes or "").strip() or None,
+            },
+        ).mappings().first()
+    return {
+        "assignment": {
+            "id": int(row["id"]),
+            "student_id": str(row["student_id"]),
+            "subject": row["subject"],
+            "unit_key": row["unit_key"],
+            "unit_name": resolve_unit_name(row["subject"], row["unit_key"]),
+            "title": row["title"],
+            "target_attempts": int(row["target_attempts"] or 0),
+            "completed_attempts": int(row["completed_attempts"] or 0),
+            "difficulty": row.get("difficulty"),
+            "notes": row.get("notes"),
+            "status": row["status"],
+            "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
+        }
+    }
+
+
+@app.post("/teacher/questions/suggest")
+def suggest_teacher_questions(payload: TeacherQuestionSuggestPayload, request: Request):
+    require_user(request, allowed_roles=["teacher"])
+    suggestions = generate_teacher_question_suggestions(
+        subject=payload.subject,
+        unit_key=payload.unit_key,
+        difficulty=payload.difficulty,
+        objective=payload.objective,
+        count=max(1, min(int(payload.count or 3), 8)),
+    )
+    return {"suggestions": suggestions}
+
+
+@app.get("/teacher/dashboard")
+def teacher_dashboard(request: Request):
+    require_user(request, allowed_roles=["teacher"])
+    with engine.begin() as conn:
+        students = conn.execute(LIST_STUDENTS_SQL).mappings().all()
+        total_students = len(students)
+        activity_rows = conn.execute(
+            text(
+                """
+                select date(created_at) as d, count(*) as n
+                from attempts
+                where created_at >= now() - interval '7 days'
+                group by 1
+                order by d asc
+                """
+            )
+        ).mappings().all()
+        progress_rows = conn.execute(
+            text(
+                """
+                select sp.student_id, u.display_name, u.email, sp.subject, sp.accuracy, sp.total_attempts, sp.last_answer_at
+                from student_progress sp
+                join users u on u.id = sp.student_id
+                where lower(u.email) not like '%test%'
+                order by sp.last_answer_at desc nulls last
+                """
+            )
+        ).mappings().all()
+        unit_rows = conn.execute(
+            text(
+                """
+                select sup.student_id, u.display_name, u.email, sup.subject, sup.unit_key, sup.unit_name, sup.accuracy, sup.p_mastery, sup.total_attempts
+                from student_unit_progress sup
+                join users u on u.id = sup.student_id
+                where lower(u.email) not like '%test%'
+                order by sup.subject, sup.unit_name
+                """
+            )
+        ).mappings().all()
+        assignment_rows = conn.execute(
+            text(
+                """
+                select count(*) filter (where status = 'active') as active_count,
+                       count(*) filter (where status = 'completed') as completed_count
+                from teacher_assignments
+                """
+            )
+        ).mappings().first() or {"active_count": 0, "completed_count": 0}
+        notes_count = conn.execute(text("select count(*) from teacher_notes")).scalar() or 0
+
+    grouped_students: dict[str, dict] = {}
+    for row in progress_rows:
+        sid = str(row["student_id"])
+        grouped_students.setdefault(
+            sid,
+            {
+                "student_id": sid,
+                "student_name": row.get("display_name") or row.get("email"),
+                "subjects": {},
+                "last_answer_at": row.get("last_answer_at"),
+            },
+        )
+        grouped_students[sid]["subjects"][row["subject"]] = {
+            "accuracy": float(row["accuracy"] or 0),
+            "total_attempts": int(row["total_attempts"] or 0),
+        }
+        if row.get("last_answer_at") and (
+            not grouped_students[sid]["last_answer_at"]
+            or row["last_answer_at"] > grouped_students[sid]["last_answer_at"]
+        ):
+            grouped_students[sid]["last_answer_at"] = row["last_answer_at"]
+
+    at_risk = []
+    inactive = []
+    now_dt = datetime.now(timezone.utc)
+    for student in students:
+        sid = str(student["id"])
+        info = grouped_students.get(sid)
+        if not info or not info.get("last_answer_at"):
+            inactive.append(
+                {"student_id": sid, "student_name": student.get("display_name") or student.get("email"), "reason": "Sin actividad registrada"}
+            )
+            continue
+        last_answer = info["last_answer_at"]
+        if isinstance(last_answer, datetime) and (now_dt - last_answer).days >= 5:
+            inactive.append(
+                {
+                    "student_id": sid,
+                    "student_name": info["student_name"],
+                    "reason": f"Sin actividad desde hace {(now_dt - last_answer).days} días",
+                }
+            )
+        low_subjects = [
+            subj for subj, metrics in info["subjects"].items()
+            if metrics["total_attempts"] >= 3 and metrics["accuracy"] < 0.55
+        ]
+        if low_subjects:
+            at_risk.append(
+                {
+                    "student_id": sid,
+                    "student_name": info["student_name"],
+                    "subjects": low_subjects,
+                }
+            )
+
+    unit_summary: dict[tuple[str, str], dict] = {}
+    heatmap: List[dict] = []
+    for row in unit_rows:
+        key = (row["subject"], row["unit_key"])
+        bucket = unit_summary.setdefault(
+            key,
+            {
+                "subject": row["subject"],
+                "unit_key": row["unit_key"],
+                "unit_name": row["unit_name"],
+                "students": 0,
+                "accuracy_total": 0.0,
+                "mastery_total": 0.0,
+            },
+        )
+        bucket["students"] += 1
+        bucket["accuracy_total"] += float(row["accuracy"] or 0)
+        bucket["mastery_total"] += float(row["p_mastery"] or 0)
+        heatmap.append(
+            {
+                "student_id": str(row["student_id"]),
+                "student_name": row.get("display_name") or row.get("email"),
+                "subject": row["subject"],
+                "unit_key": row["unit_key"],
+                "unit_name": row["unit_name"],
+                "accuracy": float(row["accuracy"] or 0),
+                "p_mastery": float(row["p_mastery"] or 0),
+                "status": mastery_label(float(row["p_mastery"] or 0)),
+            }
+        )
+
+    units_ranked = []
+    for item in unit_summary.values():
+        students_count = max(1, int(item["students"]))
+        units_ranked.append(
+            {
+                "subject": item["subject"],
+                "unit_key": item["unit_key"],
+                "unit_name": item["unit_name"],
+                "students": int(item["students"]),
+                "accuracy_avg": item["accuracy_total"] / students_count,
+                "mastery_avg": item["mastery_total"] / students_count,
+            }
+        )
+    units_ranked.sort(key=lambda x: (x["mastery_avg"], x["accuracy_avg"]))
+
+    recommendations = []
+    if units_ranked:
+        first = units_ranked[0]
+        recommendations.append(
+            f"Conviene reforzar {first['unit_name']} en {first['subject']}: dominio medio {int(first['mastery_avg']*100)}%."
+        )
+    if inactive:
+        recommendations.append(f"Hay {len(inactive)} alumnos con baja actividad reciente.")
+    if at_risk:
+        recommendations.append(f"{len(at_risk)} alumnos presentan riesgo académico en al menos una materia.")
+
+    return {
+        "overview": {
+            "total_students": total_students,
+            "active_assignments": int(assignment_rows["active_count"] or 0),
+            "completed_assignments": int(assignment_rows["completed_count"] or 0),
+            "teacher_notes": int(notes_count or 0),
+        },
+        "activity_last_7_days": [
+            {"date": str(r["d"]), "attempts": int(r["n"] or 0)}
+            for r in activity_rows
+        ],
+        "students_overview": [
+            {
+                "student_id": item["student_id"],
+                "student_name": item["student_name"],
+                "last_answer_at": item["last_answer_at"].isoformat() if item.get("last_answer_at") else None,
+                "subjects": item["subjects"],
+            }
+            for item in grouped_students.values()
+        ],
+        "alerts": {
+            "at_risk": at_risk[:8],
+            "inactive": inactive[:8],
+        },
+        "units_summary": units_ranked,
+        "heatmap": heatmap,
+        "recommendations": recommendations,
+    }
 
 
 @app.get("/progress/daily")
@@ -1500,9 +2197,15 @@ UPDATE_STUDENT_AGE_SQL = text(
 )
 INSERT_CUSTOM_ITEM_SQL = text(
     """
-    insert into custom_items (subject, prompt, options, answer, created_by)
-    values (lower(:subject), :prompt, CAST(:options AS jsonb), :answer, :created_by)
-    returning id, subject, prompt, options, answer, created_at
+    insert into custom_items (
+        subject, prompt, options, answer, unit_key, difficulty,
+        evaluation_mode, accepted_answers, rubric, created_by
+    )
+    values (
+        lower(:subject), :prompt, CAST(:options AS jsonb), :answer, :unit_key, :difficulty,
+        :evaluation_mode, CAST(:accepted_answers AS jsonb), :rubric, :created_by
+    )
+    returning id, subject, prompt, options, answer, unit_key, difficulty, evaluation_mode, accepted_answers, rubric, created_at
     """
 )
 UPDATE_CUSTOM_ITEM_SQL = text(
@@ -1511,14 +2214,19 @@ UPDATE_CUSTOM_ITEM_SQL = text(
     set subject = lower(:subject),
         prompt = :prompt,
         options = CAST(:options AS jsonb),
-        answer = :answer
+        answer = :answer,
+        unit_key = :unit_key,
+        difficulty = :difficulty,
+        evaluation_mode = :evaluation_mode,
+        accepted_answers = CAST(:accepted_answers AS jsonb),
+        rubric = :rubric
     where id = :id and created_by = :teacher_id
-    returning id, subject, prompt, options, answer, created_at
+    returning id, subject, prompt, options, answer, unit_key, difficulty, evaluation_mode, accepted_answers, rubric, created_at
     """
 )
 SELECT_CUSTOM_ITEM_SQL = text(
     """
-    select id, subject, prompt, options, answer, created_by
+    select id, subject, prompt, options, answer, unit_key, difficulty, evaluation_mode, accepted_answers, rubric, created_by
     from custom_items
     where id = :id
     """
@@ -1534,6 +2242,7 @@ LIST_STUDENTS_SQL = text(
     select id, email, display_name, age, created_at
     from users
     where role = 'student'
+      and lower(email) not like '%test%'
     order by created_at asc
     """
 )
@@ -1547,7 +2256,7 @@ LIST_ACHIEVEMENTS_SQL = text(
 )
 LIST_CUSTOM_BY_CREATOR_SQL = text(
     """
-    select id, subject, prompt, options, answer, created_at
+    select id, subject, prompt, options, answer, unit_key, difficulty, evaluation_mode, accepted_answers, rubric, created_at
     from custom_items
     where created_by = :user_id
     order by created_at desc
@@ -1555,9 +2264,11 @@ LIST_CUSTOM_BY_CREATOR_SQL = text(
 )
 RANDOM_CUSTOM_ITEMS_SQL = text(
     """
-    select id, subject, prompt, options, answer
+    select id, subject, prompt, options, answer, unit_key, difficulty, evaluation_mode, accepted_answers, rubric
     from custom_items
     where lower(subject) = :subject and is_active = true
+      and (:unit_key is null or unit_key = :unit_key)
+      and (:difficulty is null or difficulty is null or difficulty = :difficulty)
     order by random()
     limit :k
     """
@@ -1630,6 +2341,13 @@ async def post_attempt(request: Request):
             unit_key=str(attempt_dict.get("unit_key") or "").strip().lower() or None,
             is_correct=bool(attempt_dict["is_correct"]),
             last_answer_at=p.get("last_answer_at"),
+        )
+        update_assignment_progress(
+            conn,
+            student_id=attempt_dict["student_id"],
+            subject=str(attempt_dict["subject"]),
+            unit_key=str(attempt_dict.get("unit_key") or "").strip().lower() or None,
+            attempt_created_at=p.get("last_answer_at"),
         )
         unlocked = []
         # Reglas de logros básicos
@@ -1899,9 +2617,22 @@ def next_items(
     # Obtener contexto del alumno para que la IA ajuste la dificultad
     student_ctx = {}
     already_answered_prompts: List[str] = []
+    active_assignment = None
     try:
         with engine.begin() as conn:
             student_ctx = get_student_context(conn, token_student_id, subj)
+            active_assignment = conn.execute(
+                text(
+                    """
+                    select id, unit_key, difficulty, title, target_attempts, completed_attempts
+                    from teacher_assignments
+                    where student_id = :sid and subject = :subject and status = 'active'
+                    order by created_at asc
+                    limit 1
+                    """
+                ),
+                {"sid": token_student_id, "subject": subj},
+            ).mappings().first()
 
             # Obtener las últimas preguntas contestadas correctamente por IA para evitar repetirlas
             rows_prompts = conn.execute(
@@ -1930,6 +2661,8 @@ def next_items(
         band=bands[0] if bands else "B",
         student_context=student_ctx,
         already_answered_prompts=already_answered_prompts,
+        target_unit_key=str((active_assignment or {}).get("unit_key") or "") or None,
+        target_difficulty=str((active_assignment or {}).get("difficulty") or "") or None,
     )
 
     # 3) Fallback mínimo: si OpenAI falla, usamos la consulta antigua
@@ -1997,7 +2730,13 @@ def next_items(
 
             try:
                 custom_rows = conn.execute(
-                    RANDOM_CUSTOM_ITEMS_SQL, {"subject": subj, "k": k}
+                    RANDOM_CUSTOM_ITEMS_SQL,
+                    {
+                        "subject": subj,
+                        "k": k,
+                        "unit_key": (active_assignment or {}).get("unit_key"),
+                        "difficulty": (active_assignment or {}).get("difficulty"),
+                    },
                 ).mappings().all()
             except Exception as custom_exc:
                 logger.error("custom_items query failed: %s", custom_exc)
@@ -2005,7 +2744,13 @@ def next_items(
         try:
             with engine.begin() as conn:
                 custom_rows = conn.execute(
-                    RANDOM_CUSTOM_ITEMS_SQL, {"subject": subj, "k": k}
+                    RANDOM_CUSTOM_ITEMS_SQL,
+                    {
+                        "subject": subj,
+                        "k": k,
+                        "unit_key": (active_assignment or {}).get("unit_key"),
+                        "difficulty": (active_assignment or {}).get("difficulty"),
+                    },
                 ).mappings().all()
         except Exception as custom_exc:
             logger.error("custom_items query failed: %s", custom_exc)
@@ -2038,7 +2783,11 @@ def next_items(
                 "evaluation_mode": r.get("evaluation_mode") or ("exact" if opts else ("accepted_answers" if subj == "castellano" else "exact")),
                 "accepted_answers": parse_string_list(r.get("accepted_answers")),
                 "rubric": r.get("rubric") or "",
-                "reason": r.get("reason") or ("refuerzo" if mode == "adaptive" else "aleatorio"),
+                "reason": (
+                    "asignacion"
+                    if active_assignment and r.get("unit_key") == active_assignment.get("unit_key")
+                    else r.get("reason") or ("refuerzo" if mode == "adaptive" else "aleatorio")
+                ),
             }
         )
 
@@ -2066,7 +2815,7 @@ def next_items(
                 "evaluation_mode": r.get("evaluation_mode") or ("exact" if opts else ("accepted_answers" if subj == "castellano" else "exact")),
                 "accepted_answers": parse_string_list(r.get("accepted_answers")),
                 "rubric": r.get("rubric") or "",
-                "reason": "custom",
+                "reason": "asignacion" if active_assignment else "custom",
             }
         )
 
