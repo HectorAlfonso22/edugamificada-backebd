@@ -44,12 +44,12 @@ if not logger.handlers:
     logger.addHandler(stream_handler)
 logger.propagate = False
 
-# Carga variables de entorno antes de leer DATABASE_URL (carga explícita del .env en el backend)
+# Carga variables de entorno antes de leer DATABASE_URL (carga explÃ­cita del .env en el backend)
 load_dotenv(BASE_DIR / ".env")
 logger.info("Loaded .env from %s", BASE_DIR / ".env")
 
 # ---------------------------
-# Configuración / Conexión DB
+# ConfiguraciÃ³n / ConexiÃ³n DB
 # ---------------------------
 DATABASE_URL = os.getenv("DATABASE_URL")
 logger.info("DATABASE_URL = %s", DATABASE_URL)
@@ -197,6 +197,66 @@ CREATE_TEACHER_NOTES_INDEX = text(
         on teacher_notes (student_id, updated_at desc)
     """
 )
+CREATE_STUDENT_PROFILES_TABLE = text(
+    """
+    create table if not exists student_profiles (
+        student_id uuid primary key references users(id) on delete cascade,
+        avatar text,
+        friend_code text not null unique,
+        bio text,
+        created_at timestamptz not null default now(),
+        updated_at timestamptz not null default now()
+    )
+    """
+)
+CREATE_FRIEND_REQUESTS_TABLE = text(
+    """
+    create table if not exists friend_requests (
+        id bigserial primary key,
+        requester_id uuid not null references users(id) on delete cascade,
+        addressee_id uuid not null references users(id) on delete cascade,
+        status text not null default 'pending',
+        created_at timestamptz not null default now(),
+        responded_at timestamptz,
+        unique (requester_id, addressee_id)
+    )
+    """
+)
+CREATE_FRIEND_REQUESTS_INDEX = text(
+    """
+    create index if not exists idx_friend_requests_addressee
+        on friend_requests (addressee_id, status, created_at desc)
+    """
+)
+CREATE_FRIENDSHIPS_TABLE = text(
+    """
+    create table if not exists friendships (
+        id bigserial primary key,
+        student_low_id uuid not null references users(id) on delete cascade,
+        student_high_id uuid not null references users(id) on delete cascade,
+        created_at timestamptz not null default now(),
+        unique (student_low_id, student_high_id),
+        check (student_low_id <> student_high_id)
+    )
+    """
+)
+CREATE_SHARED_STREAKS_TABLE = text(
+    """
+    create table if not exists shared_streaks (
+        id bigserial primary key,
+        student_low_id uuid not null references users(id) on delete cascade,
+        student_high_id uuid not null references users(id) on delete cascade,
+        created_by uuid not null references users(id) on delete cascade,
+        title text,
+        best_streak int not null default 0,
+        current_streak int not null default 0,
+        last_synced_on date,
+        created_at timestamptz not null default now(),
+        unique (student_low_id, student_high_id),
+        check (student_low_id <> student_high_id)
+    )
+    """
+)
 
 CURRICULUM_UNITS = {
     "matematica": [
@@ -299,6 +359,11 @@ def ensure_custom_tables():
             conn.execute(CREATE_TEACHER_ASSIGNMENTS_INDEX)
             conn.execute(CREATE_TEACHER_NOTES_TABLE)
             conn.execute(CREATE_TEACHER_NOTES_INDEX)
+            conn.execute(CREATE_STUDENT_PROFILES_TABLE)
+            conn.execute(CREATE_FRIEND_REQUESTS_TABLE)
+            conn.execute(CREATE_FRIEND_REQUESTS_INDEX)
+            conn.execute(CREATE_FRIENDSHIPS_TABLE)
+            conn.execute(CREATE_SHARED_STREAKS_TABLE)
         logger.info("custom_items table ready")
     except Exception as exc:
         logger.error("Failed to ensure custom_items table: %s", exc)
@@ -306,7 +371,7 @@ def ensure_custom_tables():
 
 ensure_custom_tables()
 
-# Parámetros BKT-lite (puedes ajustarlos en .env)
+# ParÃ¡metros BKT-lite (puedes ajustarlos en .env)
 SLIP  = float(os.getenv("SLIP", 0.10))
 GUESS = float(os.getenv("GUESS", 0.20))
 LEARN = float(os.getenv("LEARN", 0.15))
@@ -320,7 +385,7 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 logger.info("OpenAI client configured: %s", bool(openai_client))
 
-# Cache simple en memoria para evitar llamar a la IA repetidamente con los mismos parámetros
+# Cache simple en memoria para evitar llamar a la IA repetidamente con los mismos parÃ¡metros
 _AI_ITEMS_CACHE: dict = {}
 _CACHE_LOCK = threading.Lock()
 _CACHE_TTL_SECONDS = 90
@@ -347,7 +412,7 @@ app.add_middleware(
 class AttemptIn(BaseModel):
     student_id: str
     item_id: int
-    # Puedes enviar directamente la corrección...
+    # Puedes enviar directamente la correcciÃ³n...
     correct: Optional[bool] = None
     # ...o enviar la respuesta para validarla server-side:
     answer_text: Optional[str] = None
@@ -407,6 +472,21 @@ class TeacherQuestionSuggestPayload(BaseModel):
     count: int = 3
 
 
+class StudentProfileUpdatePayload(BaseModel):
+    display_name: Optional[str] = None
+    avatar: Optional[str] = None
+    bio: Optional[str] = None
+
+
+class FriendRequestCreatePayload(BaseModel):
+    friend_code: str
+
+
+class SharedStreakCreatePayload(BaseModel):
+    friend_id: str
+    title: Optional[str] = None
+
+
 # ---------------------------
 # Utilidades
 # ---------------------------
@@ -453,19 +533,186 @@ def sanitize_user(row: dict) -> dict:
     }
 
 
+def ordered_pair(left: str, right: str) -> tuple[str, str]:
+    return (left, right) if left < right else (right, left)
+
+
+def generate_friend_code() -> str:
+    return f"EDU-{random.randint(100000, 999999)}"
+
+
+def ensure_student_profile(conn, student_id: str) -> dict:
+    row = conn.execute(
+        text(
+            """
+            select student_id, avatar, friend_code, bio, created_at, updated_at
+            from student_profiles
+            where student_id = :sid
+            """
+        ),
+        {"sid": student_id},
+    ).mappings().first()
+    if row:
+        return dict(row)
+
+    code = generate_friend_code()
+    for _ in range(6):
+        try:
+            row = conn.execute(
+                text(
+                    """
+                    insert into student_profiles (student_id, avatar, friend_code, bio)
+                    values (cast(:sid as uuid), :avatar, :friend_code, :bio)
+                    returning student_id, avatar, friend_code, bio, created_at, updated_at
+                    """
+                ),
+                {"sid": student_id, "avatar": "star", "friend_code": code, "bio": None},
+            ).mappings().first()
+            if row:
+                return dict(row)
+        except Exception:
+            code = generate_friend_code()
+    raise HTTPException(status_code=500, detail="No se pudo crear el perfil social")
+
+
+def are_friends(conn, left_id: str, right_id: str) -> bool:
+    low_id, high_id = ordered_pair(left_id, right_id)
+    row = conn.execute(
+        text(
+            """
+            select 1
+            from friendships
+            where student_low_id = cast(:low_id as uuid)
+              and student_high_id = cast(:high_id as uuid)
+            """
+        ),
+        {"low_id": low_id, "high_id": high_id},
+    ).first()
+    return bool(row)
+
+
+def build_student_profile_payload(conn, viewer_id: str, target_id: str) -> dict:
+    target = conn.execute(
+        text(
+            """
+            select id, email, role, display_name, age, created_at
+            from users
+            where id = cast(:sid as uuid)
+            """
+        ),
+        {"sid": target_id},
+    ).mappings().first()
+    if not target or target["role"] != "student":
+        raise HTTPException(status_code=404, detail="Alumno no encontrado")
+
+    profile = ensure_student_profile(conn, target_id)
+    friendship = viewer_id != target_id and are_friends(conn, viewer_id, target_id)
+    achievements_count = conn.execute(
+        text("select count(*) from achievements where student_id = cast(:sid as uuid)"),
+        {"sid": target_id},
+    ).scalar() or 0
+    active_streaks = conn.execute(
+        text(
+            """
+            select count(*)
+            from shared_streaks
+            where student_low_id = cast(:sid as uuid) or student_high_id = cast(:sid as uuid)
+            """
+        ),
+        {"sid": target_id},
+    ).scalar() or 0
+
+    return {
+        "user": sanitize_user(dict(target)),
+        "profile": {
+            "avatar": profile.get("avatar") or "star",
+            "friend_code": profile.get("friend_code"),
+            "bio": profile.get("bio"),
+            "is_self": viewer_id == target_id,
+            "is_friend": friendship,
+            "achievements_count": int(achievements_count or 0),
+            "shared_streaks_count": int(active_streaks or 0),
+        },
+    }
+
+
+def attempts_by_date(conn, student_id: str, date_from: date) -> set[date]:
+    rows = conn.execute(
+        text(
+            """
+            select distinct date(created_at) as d
+            from attempts
+            where student_id = cast(:sid as uuid)
+              and date(created_at) >= :date_from
+            """
+        ),
+        {"sid": student_id, "date_from": date_from},
+    ).scalars().all()
+    return {r for r in rows if isinstance(r, date)}
+
+
+def sync_shared_streak(conn, streak_row) -> dict:
+    low_id = str(streak_row["student_low_id"])
+    high_id = str(streak_row["student_high_id"])
+    created_date = streak_row["created_at"].date() if isinstance(streak_row.get("created_at"), datetime) else date.today()
+    dates_low = attempts_by_date(conn, low_id, created_date)
+    dates_high = attempts_by_date(conn, high_id, created_date)
+    common_dates = sorted(dates_low.intersection(dates_high))
+
+    current_streak = 0
+    cursor = date.today()
+    while cursor in common_dates:
+        current_streak += 1
+        cursor = cursor - timedelta(days=1)
+
+    best_streak = 0
+    run = 0
+    previous = None
+    for day_value in common_dates:
+        if previous and (day_value - previous).days == 1:
+            run += 1
+        else:
+            run = 1
+        best_streak = max(best_streak, run)
+        previous = day_value
+
+    best_streak = max(best_streak, int(streak_row.get("best_streak") or 0))
+    conn.execute(
+        text(
+            """
+            update shared_streaks
+            set current_streak = :current_streak,
+                best_streak = :best_streak,
+                last_synced_on = current_date
+            where id = :id
+            """
+        ),
+        {
+            "current_streak": current_streak,
+            "best_streak": best_streak,
+            "id": streak_row["id"],
+        },
+    )
+    return {
+        "id": int(streak_row["id"]),
+        "current_streak": current_streak,
+        "best_streak": best_streak,
+    }
+
+
 def build_strengths_fallback(accuracy: float, attempts: int, time_avg_s: float) -> List[str]:
     strengths: List[str] = []
     acc_pct = int(accuracy * 100)
     if accuracy >= 0.8:
-        strengths.append(f"Precisión sólida ({acc_pct}%).")
+        strengths.append(f"PrecisiÃ³n sÃ³lida ({acc_pct}%).")
     elif accuracy >= 0.6:
-        strengths.append(f"Precisión aceptable ({acc_pct}%), sigue reforzando.")
+        strengths.append(f"PrecisiÃ³n aceptable ({acc_pct}%), sigue reforzando.")
     if attempts >= 10:
         strengths.append(f"Constancia: {attempts} intentos acumulados.")
     if time_avg_s and time_avg_s <= 8:
         strengths.append(f"Buen ritmo de respuesta ({time_avg_s}s).")
     if not strengths:
-        strengths.append("Continúas practicando, sigue así.")
+        strengths.append("ContinÃºas practicando, sigue asÃ­.")
     return strengths
 
 
@@ -708,7 +955,7 @@ def build_student_missions(conn, student_id: str, subject: str) -> List[dict]:
             {
                 "code": f"practice_{subject}_{weakest['unit_key']}",
                 "title": f"Practica {weakest['unit_name']}",
-                "description": f"Completa {practice_target} intentos acumulados en esta unidad para ganar más base.",
+                "description": f"Completa {practice_target} intentos acumulados en esta unidad para ganar mÃ¡s base.",
                 "unit_key": weakest["unit_key"],
                 "unit_name": weakest["unit_name"],
                 "subject": subject,
@@ -718,7 +965,7 @@ def build_student_missions(conn, student_id: str, subject: str) -> List[dict]:
                 "status": "completed" if attempts_now >= practice_target else "active",
             }
         )
-        mastery_now = float(weakest.get("p_mastery") or 0.0)
+        mastery_now = float(weakest.get("p_mastery") or 0.0) if attempts_now > 0 else 0.0
         missions.append(
             {
                 "code": f"mastery_{subject}_{weakest['unit_key']}",
@@ -735,7 +982,8 @@ def build_student_missions(conn, student_id: str, subject: str) -> List[dict]:
         )
 
     if strongest:
-        mastery_now = float(strongest.get("p_mastery") or 0.0)
+        strongest_attempts = int(strongest.get("total_attempts") or 0)
+        mastery_now = float(strongest.get("p_mastery") or 0.0) if strongest_attempts > 0 else 0.0
         missions.append(
             {
                 "code": f"dominate_{subject}_{strongest['unit_key']}",
@@ -842,7 +1090,7 @@ def recent_accuracy_by_subject(conn, student_id: str, subject: str) -> Optional[
                     join items i on i.id = a.item_id
                     where a.student_id = :sid
                       and lower(trim(
-                          replace(replace(replace(replace(replace(i.subject,'á','a'),'é','e'),'í','i'),'ó','o'),'ú','u')
+                          replace(replace(replace(replace(replace(i.subject,'Ã¡','a'),'Ã©','e'),'Ã­','i'),'Ã³','o'),'Ãº','u')
                       )) = :subject
                     order by a.created_at desc
                     limit 10
@@ -896,16 +1144,16 @@ def generate_ai_summary(context: dict) -> Optional[dict]:
     prompt = f"""
 Eres un tutor educativo. Usa estos datos:
 - Intentos: {context['attempts']}
-- Precisión: {context['accuracy_percent']}%
+- PrecisiÃ³n: {context['accuracy_percent']}%
 - Tiempo promedio (s): {context['time_avg_s']}
-- Habilidades más débiles: {context['weak_list']}
+- Habilidades mÃ¡s dÃ©biles: {context['weak_list']}
 
 Devuelve SIEMPRE un JSON con:
-- overview: frase breve (1-2 líneas)
-- strengths: lista con al menos 2 fortalezas concretas (ej: "Precisión sólida", "Buen ritmo", "Constancia en intentos")
-- focus: lista con al menos 2 próximos pasos accionables (ej: "Practicar Sumas 0-20", "Repasar Restas 0-10")
+- overview: frase breve (1-2 lÃ­neas)
+- strengths: lista con al menos 2 fortalezas concretas (ej: "PrecisiÃ³n sÃ³lida", "Buen ritmo", "Constancia en intentos")
+- focus: lista con al menos 2 prÃ³ximos pasos accionables (ej: "Practicar Sumas 0-20", "Repasar Restas 0-10")
 
-Sé conciso, positivo y específico.
+SÃ© conciso, positivo y especÃ­fico.
 """
     models_to_try = [OPENAI_MODEL] if OPENAI_MODEL else []
     if "gpt-4o-mini" not in models_to_try:
@@ -933,25 +1181,25 @@ Sé conciso, positivo y específico.
 
 
 def generate_ai_feedback(question: str, user_answer: str, correct_answer: str, subject: str) -> Optional[str]:
-    """Genera una retroalimentación breve y motivadora cuando la respuesta es incorrecta."""
+    """Genera una retroalimentaciÃ³n breve y motivadora cuando la respuesta es incorrecta."""
     if not openai_client:
         return None
 
     prompt = f"""
-Eres un docente amable y motivador. El alumno respondió mal a una pregunta.
+Eres un docente amable y motivador. El alumno respondiÃ³ mal a una pregunta.
 
 Pregunta: {question}
 Respuesta del alumno: {user_answer}
 Respuesta correcta: {correct_answer}
 Materia: {subject}
 
-Da una retroalimentación corta (1-2 oraciones) explicando:
-- por qué la opción del alumno no es correcta
-- cómo llegar a la respuesta correcta
+Da una retroalimentaciÃ³n corta (1-2 oraciones) explicando:
+- por quÃ© la opciÃ³n del alumno no es correcta
+- cÃ³mo llegar a la respuesta correcta
 
-Sé positivo, evita sonar crítico y no incluyas la palabra 'incorrecto' al inicio.
+SÃ© positivo, evita sonar crÃ­tico y no incluyas la palabra 'incorrecto' al inicio.
 
-Responde solo con el texto de retroalimentación, sin encabezados ni formato extra.
+Responde solo con el texto de retroalimentaciÃ³n, sin encabezados ni formato extra.
 """
 
     models_to_try = [OPENAI_MODEL] if OPENAI_MODEL else []
@@ -1109,7 +1357,7 @@ Genera exactamente un JSON con una lista "items" para que el profesor pueda revi
 Materia: {subject}
 Unidad: {unit_name} ({unit_key})
 Dificultad sugerida: {difficulty or 'media'}
-Objetivo pedagógico: {objective or 'reforzar contenidos clave del tercer grado'}
+Objetivo pedagÃ³gico: {objective or 'reforzar contenidos clave del tercer grado'}
 Cantidad: {count}
 
 Cada item debe tener:
@@ -1121,9 +1369,9 @@ Cada item debe tener:
 - rubric
 
 Reglas:
-- Si es opción múltiple usa evaluation_mode="exact".
-- Si es respuesta abierta de Castellano con varias respuestas válidas, usa evaluation_mode="accepted_answers" o "ai_judge" cuando haga falta criterio.
-- Mantén el nivel adecuado para tercer grado.
+- Si es opciÃ³n mÃºltiple usa evaluation_mode="exact".
+- Si es respuesta abierta de Castellano con varias respuestas vÃ¡lidas, usa evaluation_mode="accepted_answers" o "ai_judge" cuando haga falta criterio.
+- MantÃ©n el nivel adecuado para tercer grado.
 
 Devuelve solo JSON.
 """
@@ -1191,7 +1439,7 @@ def _get_cached_items(key: str) -> Optional[List[dict]]:
 def _set_cached_items(key: str, items: List[dict]) -> None:
     with _CACHE_LOCK:
         if len(_AI_ITEMS_CACHE) >= _CACHE_MAX_ENTRIES:
-            # borrar el cache más viejo
+            # borrar el cache mÃ¡s viejo
             oldest = min(_AI_ITEMS_CACHE.items(), key=lambda kv: kv[1]["ts"])[0]
             del _AI_ITEMS_CACHE[oldest]
         _AI_ITEMS_CACHE[key] = {"ts": time.time(), "items": items}
@@ -1241,7 +1489,7 @@ def generate_ai_items(
         ctx_lines.append(f"Precision actual: {acc * 100:.0f}%" if acc is not None else "")
         ctx_lines.append(f"Intentos totales: {attempts}" if attempts is not None else "")
         if weak:
-            ctx_lines.append(f"Habilidades débiles: {', '.join(weak)}")
+            ctx_lines.append(f"Habilidades dÃ©biles: {', '.join(weak)}")
         if weak_units_ctx:
             ctx_lines.append(
                 "Unidades a fortalecer: "
@@ -1283,7 +1531,7 @@ def generate_ai_items(
 
     prompt = f"""
 Eres un tutor educativo de primaria.
-Genera exactamente un JSON válido con un arreglo llamado "items".
+Genera exactamente un JSON vÃ¡lido con un arreglo llamado "items".
 Cada item debe tener:
   - prompt: texto de la pregunta
   - options: lista de opciones (puede ser [] para respuesta libre)
@@ -1306,22 +1554,22 @@ Unidades curriculares permitidas para {subject}:
 {curriculum_prompt}
 
 IMPORTANTE:
-- Si la materia es "castellano", SOLO genera ejercicios de lengua (gramática, ortografía, lectura, vocabulario, comprensión). NO incluyas operaciones numéricas ni problemas matemáticos.
-- Si la materia es "matematica", SOLO genera ejercicios de matemáticas (aritmética, lógica, problemas numéricos). NO incluyas preguntas de idioma.
-- Para cada ejercicio, asigna el unit_key correcto según la unidad curricular trabajada.
+- Si la materia es "castellano", SOLO genera ejercicios de lengua (gramÃ¡tica, ortografÃ­a, lectura, vocabulario, comprensiÃ³n). NO incluyas operaciones numÃ©ricas ni problemas matemÃ¡ticos.
+- Si la materia es "matematica", SOLO genera ejercicios de matemÃ¡ticas (aritmÃ©tica, lÃ³gica, problemas numÃ©ricos). NO incluyas preguntas de idioma.
+- Para cada ejercicio, asigna el unit_key correcto segÃºn la unidad curricular trabajada.
 - unit_key debe ser exactamente uno de estos valores: {valid_keys_text}
-- Si se indica una unidad prioritaria, concentra la mayoría de los ejercicios en esa unidad.
+- Si se indica una unidad prioritaria, concentra la mayorÃ­a de los ejercicios en esa unidad.
 - Si la materia es "matematica" y NO hay unidad prioritaria, distribuye el lote entre distintas unidades curriculares y evita concentrar todo en "operaciones_naturales".
-- Si la materia es "matematica" y generas 3 o más ejercicios sin unidad prioritaria, incluye al menos 2 unit_key distintos.
-- Si se indica una dificultad prioritaria, respétala al redactar los ejercicios.
+- Si la materia es "matematica" y generas 3 o mÃ¡s ejercicios sin unidad prioritaria, incluye al menos 2 unit_key distintos.
+- Si se indica una dificultad prioritaria, respÃ©tala al redactar los ejercicios.
 - Si la pregunta tiene una unica respuesta objetiva o es de opcion multiple, usa evaluation_mode="exact".
 - Si la pregunta de Castellano admite varias palabras correctas razonables, usa evaluation_mode="accepted_answers" y llena accepted_answers con 3 a 6 variantes validas.
 - Si la pregunta de Castellano es abierta y requiere criterio semantico o gramatical mas amplio, usa evaluation_mode="ai_judge" y explica el criterio en rubric.
 - No uses "ai_judge" para matematica.
 
 Haz {k} ejercicios.
-- Incluye al menos 1 ejercicio de opción múltiple y al menos 1 ejercicio de respuesta libre.
-- Prioriza fortalecer las habilidades débiles y las unidades a reforzar listadas, y ajusta la dificultad si el estudiante ya tiene buena precisión.
+- Incluye al menos 1 ejercicio de opciÃ³n mÃºltiple y al menos 1 ejercicio de respuesta libre.
+- Prioriza fortalecer las habilidades dÃ©biles y las unidades a reforzar listadas, y ajusta la dificultad si el estudiante ya tiene buena precisiÃ³n.
 
 Devuelve SOLO el JSON, sin texto adicional.
 Ejemplo de salida:
@@ -1438,7 +1686,7 @@ Ejemplo de salida:
 
 
 def generate_default_items(subject: str, k: int) -> List[dict]:
-    """Fallback muy básico cuando no hay datos en DB ni IA disponible."""
+    """Fallback muy bÃ¡sico cuando no hay datos en DB ni IA disponible."""
     base_id = -int(datetime.utcnow().timestamp() * 1000)
     items: List[dict] = []
 
@@ -1447,7 +1695,7 @@ def generate_default_items(subject: str, k: int) -> List[dict]:
             {
                 "id": base_id,
                 "type": "fallback",
-                "prompt": "¿Cuánto es 2 + 3?",
+                "prompt": "Â¿CuÃ¡nto es 2 + 3?",
                 "options": ["3", "4", "5", "6"],
                 "answer": "5",
                 "subject": subject,
@@ -1475,8 +1723,8 @@ def generate_default_items(subject: str, k: int) -> List[dict]:
             {
                 "id": base_id - 2,
                 "type": "fallback",
-                "prompt": "¿Cuál figura tiene 4 lados?",
-                "options": ["Triángulo", "Cuadrado", "Círculo", "Óvalo"],
+                "prompt": "Â¿CuÃ¡l figura tiene 4 lados?",
+                "options": ["TriÃ¡ngulo", "Cuadrado", "CÃ­rculo", "Ã“valo"],
                 "answer": "Cuadrado",
                 "subject": subject,
                 "unit_key": "geometria_y_medida",
@@ -1489,8 +1737,8 @@ def generate_default_items(subject: str, k: int) -> List[dict]:
             {
                 "id": base_id - 3,
                 "type": "fallback",
-                "prompt": "En una tabla de datos, ¿qué usamos para organizar cuántas veces aparece cada valor?",
-                "options": ["Frecuencia", "Perímetro", "Multiplicación", "Resta"],
+                "prompt": "En una tabla de datos, Â¿quÃ© usamos para organizar cuÃ¡ntas veces aparece cada valor?",
+                "options": ["Frecuencia", "PerÃ­metro", "MultiplicaciÃ³n", "Resta"],
                 "answer": "Frecuencia",
                 "subject": subject,
                 "unit_key": "estadistica",
@@ -1506,7 +1754,7 @@ def generate_default_items(subject: str, k: int) -> List[dict]:
             {
                 "id": base_id,
                 "type": "fallback",
-                "prompt": "¿Cuál es la palabra correcta: 'casa' o 'cassa'?",
+                "prompt": "Â¿CuÃ¡l es la palabra correcta: 'casa' o 'cassa'?",
                 "options": ["casa", "cassa"],
                 "answer": "casa",
                 "subject": subject,
@@ -1523,7 +1771,7 @@ def generate_default_items(subject: str, k: int) -> List[dict]:
                 "answer": "negro",
                 "subject": subject,
                 "evaluation_mode": "accepted_answers",
-                "accepted_answers": ["negra", "bonito", "bonita", "feliz", "pequeno", "pequeño"],
+                "accepted_answers": ["negra", "bonito", "bonita", "feliz", "pequeno", "pequeÃ±o"],
                 "rubric": "Acepta adjetivos validos y coherentes para describir al gato.",
                 "reason": "fallback",
             },
@@ -1537,7 +1785,7 @@ def get_token_from_request(request: Request) -> str:
     auth_header = request.headers.get("Authorization") or ""
     scheme, _, token = auth_header.partition(" ")
     if scheme.lower() != "bearer" or not token:
-        raise HTTPException(status_code=401, detail="Token de autenticación requerido")
+        raise HTTPException(status_code=401, detail="Token de autenticaciÃ³n requerido")
     return token
 
 
@@ -1546,7 +1794,7 @@ def require_user(request: Request, allowed_roles: Optional[List[str]] = None) ->
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
     except JWTError:
-        raise HTTPException(status_code=401, detail="Token inválido")
+        raise HTTPException(status_code=401, detail="Token invÃ¡lido")
 
     user_id = payload.get("sub")
     if not user_id:
@@ -1589,7 +1837,7 @@ def award_achievement(conn, student_id: str, code: str, title: str, desc: str) -
     return None
 
 # ---------------------------
-# Endpoints básicos de salud
+# Endpoints bÃ¡sicos de salud
 # ---------------------------
 @app.get("/health")
 def health():
@@ -1603,13 +1851,13 @@ def db_check():
 
 
 # ---------------------------
-# Autenticación y perfiles
+# AutenticaciÃ³n y perfiles
 # ---------------------------
 @app.post("/auth/register")
 def register_user(payload: RegisterPayload):
     role = payload.role.lower()
     if role not in {"student", "teacher"}:
-        raise HTTPException(status_code=400, detail="Rol inválido")
+        raise HTTPException(status_code=400, detail="Rol invÃ¡lido")
 
     if payload.age is not None and (payload.age < 3 or payload.age > 120):
         raise HTTPException(status_code=400, detail="Edad fuera de rango")
@@ -1620,7 +1868,7 @@ def register_user(payload: RegisterPayload):
     with engine.begin() as conn:
         existing = conn.execute(SELECT_USER_BY_EMAIL, {"email": payload.email}).mappings().first()
         if existing:
-            raise HTTPException(status_code=400, detail="Ese email ya está registrado")
+            raise HTTPException(status_code=400, detail="Ese email ya estÃ¡ registrado")
 
         row = conn.execute(
             INSERT_USER_SQL,
@@ -1644,7 +1892,7 @@ def login_user(payload: LoginPayload):
         row = conn.execute(SELECT_USER_BY_EMAIL, {"email": payload.email}).mappings().first()
 
     if not row or not verify_password(payload.password, row["password_hash"]):
-        raise HTTPException(status_code=401, detail="Credenciales inválidas")
+        raise HTTPException(status_code=401, detail="Credenciales invÃ¡lidas")
 
     token = create_access_token(str(row["id"]))
     return {"token": token, "user": sanitize_user(row)}
@@ -1673,6 +1921,316 @@ def update_student_age(payload: AgePayload, request: Request):
     return {"user": sanitize_user(updated)}
 
 
+@app.get("/students/me/profile")
+def get_my_profile(request: Request):
+    student = require_user(request, allowed_roles=["student"])
+    with engine.begin() as conn:
+        payload = build_student_profile_payload(conn, str(student["id"]), str(student["id"]))
+    return payload
+
+
+@app.put("/students/me/profile")
+def update_my_profile(payload: StudentProfileUpdatePayload, request: Request):
+    student = require_user(request, allowed_roles=["student"])
+    with engine.begin() as conn:
+        ensure_student_profile(conn, str(student["id"]))
+        if payload.display_name is not None:
+            conn.execute(
+                text(
+                    """
+                    update users
+                    set display_name = :display_name
+                    where id = cast(:sid as uuid)
+                    """
+                ),
+                {"display_name": (payload.display_name or "").strip() or None, "sid": str(student["id"])},
+            )
+        conn.execute(
+            text(
+                """
+                update student_profiles
+                set avatar = :avatar,
+                    bio = :bio,
+                    updated_at = now()
+                where student_id = cast(:sid as uuid)
+                """
+            ),
+            {
+                "sid": str(student["id"]),
+                "avatar": (payload.avatar or "").strip() or None,
+                "bio": (payload.bio or "").strip() or None,
+            },
+        )
+        profile = build_student_profile_payload(conn, str(student["id"]), str(student["id"]))
+    return profile
+
+
+@app.get("/students/{sid}/profile")
+def get_student_profile(sid: str, request: Request):
+    requester = require_user(request, allowed_roles=["student", "teacher"])
+    with engine.begin() as conn:
+        if requester["role"] == "student" and str(requester["id"]) != sid and not are_friends(conn, str(requester["id"]), sid):
+            raise HTTPException(status_code=403, detail="Solo puedes ver perfiles de amigos")
+        payload = build_student_profile_payload(conn, str(requester["id"]), sid)
+    return payload
+
+
+@app.post("/students/me/friend-requests")
+def create_friend_request(payload: FriendRequestCreatePayload, request: Request):
+    student = require_user(request, allowed_roles=["student"])
+    friend_code = payload.friend_code.strip().upper()
+    with engine.begin() as conn:
+        ensure_student_profile(conn, str(student["id"]))
+        target = conn.execute(
+            text(
+                """
+                select p.student_id, u.display_name, u.email
+                from student_profiles p
+                join users u on u.id = p.student_id
+                where upper(p.friend_code) = :friend_code
+                """
+            ),
+            {"friend_code": friend_code},
+        ).mappings().first()
+        if not target:
+            raise HTTPException(status_code=404, detail="CÃ³digo de amigo no encontrado")
+        if str(target["student_id"]) == str(student["id"]):
+            raise HTTPException(status_code=400, detail="No puedes agregarte a ti mismo")
+        if are_friends(conn, str(student["id"]), str(target["student_id"])):
+            raise HTTPException(status_code=400, detail="Ya son amigos")
+
+        existing = conn.execute(
+            text(
+                """
+                select id, status
+                from friend_requests
+                where (requester_id = cast(:me as uuid) and addressee_id = cast(:other as uuid))
+                   or (requester_id = cast(:other as uuid) and addressee_id = cast(:me as uuid))
+                limit 1
+                """
+            ),
+            {"me": str(student["id"]), "other": str(target["student_id"])},
+        ).mappings().first()
+        if existing and existing["status"] == "pending":
+            raise HTTPException(status_code=400, detail="Ya existe una solicitud pendiente")
+
+        row = conn.execute(
+            text(
+                """
+                insert into friend_requests (requester_id, addressee_id, status)
+                values (cast(:me as uuid), cast(:other as uuid), 'pending')
+                on conflict (requester_id, addressee_id) do update
+                set status = 'pending', responded_at = null, created_at = now()
+                returning id, requester_id, addressee_id, status, created_at
+                """
+            ),
+            {"me": str(student["id"]), "other": str(target["student_id"])},
+        ).mappings().first()
+    return {"request": {**row, "requester_id": str(row["requester_id"]), "addressee_id": str(row["addressee_id"])}}
+
+
+@app.get("/students/me/friend-requests")
+def list_my_friend_requests(request: Request):
+    student = require_user(request, allowed_roles=["student"])
+    with engine.begin() as conn:
+        rows = conn.execute(
+            text(
+                """
+                select fr.id, fr.requester_id, fr.addressee_id, fr.status, fr.created_at,
+                       u.display_name, u.email, sp.avatar, sp.friend_code
+                from friend_requests fr
+                join users u on u.id = fr.requester_id
+                left join student_profiles sp on sp.student_id = fr.requester_id
+                where fr.addressee_id = cast(:sid as uuid) and fr.status = 'pending'
+                order by fr.created_at desc
+                """
+            ),
+            {"sid": str(student["id"])},
+        ).mappings().all()
+    return {
+        "requests": [
+            {
+                "id": int(r["id"]),
+                "requester_id": str(r["requester_id"]),
+                "display_name": r.get("display_name") or r.get("email"),
+                "avatar": r.get("avatar") or "star",
+                "friend_code": r.get("friend_code"),
+                "created_at": r["created_at"].isoformat() if isinstance(r.get("created_at"), (datetime, date)) else r.get("created_at"),
+            }
+            for r in rows
+        ]
+    }
+
+
+@app.post("/students/me/friend-requests/{request_id}/accept")
+def accept_friend_request(request_id: int, request: Request):
+    student = require_user(request, allowed_roles=["student"])
+    with engine.begin() as conn:
+        row = conn.execute(
+            text(
+                """
+                select id, requester_id, addressee_id, status
+                from friend_requests
+                where id = :request_id and addressee_id = cast(:sid as uuid)
+                """
+            ),
+            {"request_id": request_id, "sid": str(student["id"])},
+        ).mappings().first()
+        if not row or row["status"] != "pending":
+            raise HTTPException(status_code=404, detail="Solicitud no encontrada")
+        low_id, high_id = ordered_pair(str(row["requester_id"]), str(row["addressee_id"]))
+        conn.execute(
+            text(
+                """
+                insert into friendships (student_low_id, student_high_id)
+                values (cast(:low_id as uuid), cast(:high_id as uuid))
+                on conflict do nothing
+                """
+            ),
+            {"low_id": low_id, "high_id": high_id},
+        )
+        conn.execute(
+            text(
+                """
+                update friend_requests
+                set status = 'accepted', responded_at = now()
+                where id = :request_id
+                """
+            ),
+            {"request_id": request_id},
+        )
+    return {"accepted": True}
+
+
+@app.post("/students/me/friend-requests/{request_id}/reject")
+def reject_friend_request(request_id: int, request: Request):
+    student = require_user(request, allowed_roles=["student"])
+    with engine.begin() as conn:
+        updated = conn.execute(
+            text(
+                """
+                update friend_requests
+                set status = 'rejected', responded_at = now()
+                where id = :request_id
+                  and addressee_id = cast(:sid as uuid)
+                  and status = 'pending'
+                returning id
+                """
+            ),
+            {"request_id": request_id, "sid": str(student["id"])},
+        ).first()
+    if not updated:
+        raise HTTPException(status_code=404, detail="Solicitud no encontrada")
+    return {"rejected": True}
+
+
+@app.get("/students/me/friends")
+def list_my_friends(request: Request):
+    student = require_user(request, allowed_roles=["student"])
+    with engine.begin() as conn:
+        rows = conn.execute(
+            text(
+                """
+                select f.id,
+                       case when f.student_low_id = cast(:sid as uuid) then u2.id else u1.id end as friend_id,
+                       case when f.student_low_id = cast(:sid as uuid) then coalesce(u2.display_name, u2.email) else coalesce(u1.display_name, u1.email) end as friend_name,
+                       case when f.student_low_id = cast(:sid as uuid) then sp2.avatar else sp1.avatar end as avatar,
+                       case when f.student_low_id = cast(:sid as uuid) then sp2.friend_code else sp1.friend_code end as friend_code,
+                       f.created_at
+                from friendships f
+                join users u1 on u1.id = f.student_low_id
+                join users u2 on u2.id = f.student_high_id
+                left join student_profiles sp1 on sp1.student_id = u1.id
+                left join student_profiles sp2 on sp2.student_id = u2.id
+                where f.student_low_id = cast(:sid as uuid) or f.student_high_id = cast(:sid as uuid)
+                order by f.created_at desc
+                """
+            ),
+            {"sid": str(student["id"])},
+        ).mappings().all()
+    return {
+        "friends": [
+            {
+                "id": int(r["id"]),
+                "friend_id": str(r["friend_id"]),
+                "friend_name": r["friend_name"],
+                "avatar": r.get("avatar") or "star",
+                "friend_code": r.get("friend_code"),
+                "created_at": r["created_at"].isoformat() if isinstance(r.get("created_at"), (datetime, date)) else r.get("created_at"),
+            }
+            for r in rows
+        ]
+    }
+
+
+@app.post("/students/me/shared-streaks")
+def create_shared_streak(payload: SharedStreakCreatePayload, request: Request):
+    student = require_user(request, allowed_roles=["student"])
+    friend_id = payload.friend_id.strip()
+    with engine.begin() as conn:
+        if not are_friends(conn, str(student["id"]), friend_id):
+            raise HTTPException(status_code=403, detail="Solo puedes crear rachas con amigos")
+        low_id, high_id = ordered_pair(str(student["id"]), friend_id)
+        row = conn.execute(
+            text(
+                """
+                insert into shared_streaks (student_low_id, student_high_id, created_by, title)
+                values (cast(:low_id as uuid), cast(:high_id as uuid), cast(:created_by as uuid), :title)
+                on conflict (student_low_id, student_high_id) do update
+                set title = coalesce(excluded.title, shared_streaks.title)
+                returning id, student_low_id, student_high_id, created_by, title, best_streak, current_streak, last_synced_on, created_at
+                """
+            ),
+            {
+                "low_id": low_id,
+                "high_id": high_id,
+                "created_by": str(student["id"]),
+                "title": (payload.title or "").strip() or "Racha en equipo",
+            },
+        ).mappings().first()
+        synced = sync_shared_streak(conn, row)
+    return {"streak": {**synced, "title": row["title"]}}
+
+
+@app.get("/students/me/shared-streaks")
+def list_shared_streaks(request: Request):
+    student = require_user(request, allowed_roles=["student"])
+    with engine.begin() as conn:
+        rows = conn.execute(
+            text(
+                """
+                select s.*, u1.display_name as low_name, u1.email as low_email, u2.display_name as high_name, u2.email as high_email,
+                       sp1.avatar as low_avatar, sp2.avatar as high_avatar
+                from shared_streaks s
+                join users u1 on u1.id = s.student_low_id
+                join users u2 on u2.id = s.student_high_id
+                left join student_profiles sp1 on sp1.student_id = s.student_low_id
+                left join student_profiles sp2 on sp2.student_id = s.student_high_id
+                where s.student_low_id = cast(:sid as uuid) or s.student_high_id = cast(:sid as uuid)
+                order by s.created_at desc
+                """
+            ),
+            {"sid": str(student["id"])},
+        ).mappings().all()
+        items = []
+        for row in rows:
+            synced = sync_shared_streak(conn, row)
+            friend_id = str(row["student_high_id"]) if str(row["student_low_id"]) == str(student["id"]) else str(row["student_low_id"])
+            friend_name = row["high_name"] or row["high_email"] if str(row["student_low_id"]) == str(student["id"]) else row["low_name"] or row["low_email"]
+            friend_avatar = row["high_avatar"] if str(row["student_low_id"]) == str(student["id"]) else row["low_avatar"]
+            items.append(
+                {
+                    **synced,
+                    "friend_id": friend_id,
+                    "friend_name": friend_name,
+                    "friend_avatar": friend_avatar or "star",
+                    "title": row.get("title") or "Racha en equipo",
+                    "created_at": row["created_at"].isoformat() if isinstance(row.get("created_at"), (datetime, date)) else row.get("created_at"),
+                }
+            )
+    return {"streaks": items}
+
+
 @app.post("/teacher/questions")
 def create_custom_question(payload: CustomQuestionPayload, request: Request):
     teacher = require_user(request, allowed_roles=["teacher"])
@@ -1683,10 +2241,10 @@ def create_custom_question(payload: CustomQuestionPayload, request: Request):
     if not payload.prompt.strip() or not payload.answer.strip():
         raise HTTPException(status_code=400, detail="Completa enunciado y respuesta")
     if payload.unit_key and payload.unit_key not in valid_unit_keys(payload.subject):
-        raise HTTPException(status_code=400, detail="Unidad inválida")
+        raise HTTPException(status_code=400, detail="Unidad invÃ¡lida")
     evaluation_mode = (payload.evaluation_mode or "exact").strip().lower()
     if evaluation_mode not in {"exact", "accepted_answers", "ai_judge"}:
-        raise HTTPException(status_code=400, detail="Modo de evaluación inválido")
+        raise HTTPException(status_code=400, detail="Modo de evaluaciÃ³n invÃ¡lido")
     if payload.subject != "castellano" and evaluation_mode == "ai_judge":
         raise HTTPException(status_code=400, detail="ai_judge solo aplica a Castellano")
 
@@ -1713,7 +2271,7 @@ def create_custom_question(payload: CustomQuestionPayload, request: Request):
 @app.put("/teacher/questions/{question_id}")
 def update_custom_question(question_id: int, payload: CustomQuestionPayload, request: Request):
     if question_id <= 0:
-        raise HTTPException(status_code=400, detail="ID inválido")
+        raise HTTPException(status_code=400, detail="ID invÃ¡lido")
 
     teacher = require_user(request, allowed_roles=["teacher"])
     norm_options = [str(o).strip() for o in payload.options if str(o).strip()]
@@ -2035,7 +2593,7 @@ def list_teacher_assignments(request: Request, student_id: Optional[str] = None)
 def create_teacher_assignment(payload: TeacherAssignmentPayload, request: Request):
     teacher = require_user(request, allowed_roles=["teacher"])
     if payload.unit_key not in valid_unit_keys(payload.subject):
-        raise HTTPException(status_code=400, detail="Unidad inválida")
+        raise HTTPException(status_code=400, detail="Unidad invÃ¡lida")
     with engine.begin() as conn:
         row = conn.execute(
             text(
@@ -2180,7 +2738,7 @@ def teacher_dashboard(request: Request):
                 {
                     "student_id": sid,
                     "student_name": info["student_name"],
-                    "reason": f"Sin actividad desde hace {(now_dt - last_answer).days} días",
+                    "reason": f"Sin actividad desde hace {(now_dt - last_answer).days} dÃ­as",
                 }
             )
         low_subjects = [
@@ -2251,7 +2809,7 @@ def teacher_dashboard(request: Request):
     if inactive:
         recommendations.append(f"Hay {len(inactive)} alumnos con baja actividad reciente.")
     if at_risk:
-        recommendations.append(f"{len(at_risk)} alumnos presentan riesgo académico en al menos una materia.")
+        recommendations.append(f"{len(at_risk)} alumnos presentan riesgo acadÃ©mico en al menos una materia.")
 
     return {
         "overview": {
@@ -2295,11 +2853,11 @@ def daily_progress(request: Request, sid: str, subject: Optional[str] = None):
         subj_norm = (
             subject.strip()
             .lower()
-            .replace("á", "a")
-            .replace("é", "e")
-            .replace("í", "i")
-            .replace("ó", "o")
-            .replace("ú", "u")
+            .replace("Ã¡", "a")
+            .replace("Ã©", "e")
+            .replace("Ã­", "i")
+            .replace("Ã³", "o")
+            .replace("Ãº", "u")
         )
 
     with engine.begin() as conn:
@@ -2308,10 +2866,19 @@ def daily_progress(request: Request, sid: str, subject: Optional[str] = None):
                 """
                 select date(a.created_at) as d, count(*) as n
                 from attempts a
-                join items i on i.id = a.item_id
+                left join items i on a.item_id > 0 and i.id = a.item_id
+                left join custom_items c on a.item_id < 0 and c.id = abs(a.item_id)
+                left join lateral (
+                    select ah.subject
+                    from ai_history ah
+                    where ah.student_id = a.student_id
+                      and abs(extract(epoch from (ah.created_at - a.created_at))) <= 120
+                    order by abs(extract(epoch from (ah.created_at - a.created_at))) asc
+                    limit 1
+                ) h on a.item_id < 0 and c.id is null
                 where a.student_id = :sid
                   and (:subject is null or lower(trim(
-                        replace(replace(replace(replace(replace(i.subject,'á','a'),'é','e'),'í','i'),'ó','o'),'ú','u')
+                        replace(replace(replace(replace(replace(coalesce(i.subject, c.subject, h.subject, ''),'Ã¡','a'),'Ã©','e'),'Ã­','i'),'Ã³','o'),'Ãº','u')
                   )) = :subject)
                 group by 1
                 order by d desc
@@ -2327,7 +2894,7 @@ def daily_progress(request: Request, sid: str, subject: Optional[str] = None):
     dates_counts = {r["d"]: int(r["n"]) for r in rows}
     if today in dates_counts:
         attempts_today = dates_counts[today]
-    # calcular racha desde hoy hacia atrás
+    # calcular racha desde hoy hacia atrÃ¡s
     cursor = today
     while cursor in dates_counts and dates_counts[cursor] > 0:
         streak_days += 1
@@ -2479,7 +3046,7 @@ async def post_attempt(request: Request):
         "response": body.get("response", body.get("answer_text")),
         "time_ms": body.get("time_ms", 0),
         "hints_used": body.get("hints_used", 0),
-        "subject": body.get("subject"),  # puede venir vacío
+        "subject": body.get("subject"),  # puede venir vacÃ­o
         "prompt": body.get("prompt"),
         "unit_key": body.get("unit_key"),
         "correct_answer": body.get("correct_answer") or body.get("answer"),
@@ -2489,7 +3056,7 @@ async def post_attempt(request: Request):
         "rubric": body.get("rubric"),
     }
 
-    # Validación mínima
+    # ValidaciÃ³n mÃ­nima
     if attempt_dict["item_id"] is None:
         raise HTTPException(status_code=400, detail="item_id es obligatorio")
 
@@ -2563,7 +3130,7 @@ async def post_attempt(request: Request):
                 )
                 if ach:
                     unlocked.append(ach)
-        # Reglas de logros básicos
+        # Reglas de logros bÃ¡sicos
         if p["current_streak"] >= 5:
             ach = award_achievement(
                 conn,
@@ -2580,8 +3147,8 @@ async def post_attempt(request: Request):
                 conn,
                 attempt_dict["student_id"],
                 "accuracy_80",
-                "Precisión 80%",
-                "Mantienes una precisión de 80% o más.",
+                "PrecisiÃ³n 80%",
+                "Mantienes una precisiÃ³n de 80% o mÃ¡s.",
             )
             if ach:
                 unlocked.append(ach)
@@ -2611,7 +3178,7 @@ async def post_attempt(request: Request):
 
     feedback_msg = None
     if not attempt_dict.get("is_correct"):
-        # Generar retroalimentación personalizada usando AI (si está configurado)
+        # Generar retroalimentaciÃ³n personalizada usando AI (si estÃ¡ configurado)
         try:
             feedback_msg = generate_ai_feedback(
                 question=str(attempt_dict.get("prompt") or ""),
@@ -2681,7 +3248,7 @@ def get_progress(student_id: UUID, subject: str):
 # ---------------------------
 # GET /next-items
 # Recomendador simple: prioriza habilidades con menor dominio,
-# incluye revisión por SRS y hace ε-greedy (explora un poco).
+# incluye revisiÃ³n por SRS y hace Îµ-greedy (explora un poco).
 # ---------------------------
 @app.get("/next-items")
 def next_items(
@@ -2703,11 +3270,11 @@ def next_items(
     subj = (
         subject.strip()
         .lower()
-        .replace("á", "a")
-        .replace("é", "e")
-        .replace("í", "i")
-        .replace("ó", "o")
-        .replace("ú", "u")
+        .replace("Ã¡", "a")
+        .replace("Ã©", "e")
+        .replace("Ã­", "i")
+        .replace("Ã³", "o")
+        .replace("Ãº", "u")
     )
 
     # 1) Consulta principal: AHORA incluye i.answer
@@ -2725,7 +3292,7 @@ def next_items(
         join skills s on s.id = i.skill_id
         left join mastery m on m.skill_id = i.skill_id and m.student_id = :student_id
         where lower(trim(
-            replace(replace(replace(replace(replace(s.subject,'á','a'),'é','e'),'í','i'),'ó','o'),'ú','u')
+            replace(replace(replace(replace(replace(s.subject,'Ã¡','a'),'Ã©','e'),'Ã­','i'),'Ã³','o'),'Ãº','u')
         )) = :subject
     """
 
@@ -2751,7 +3318,7 @@ def next_items(
                 from skills s
                 left join mastery m on m.skill_id=s.id and m.student_id=:sid
                 where lower(trim(
-                    replace(replace(replace(replace(replace(s.subject,'á','a'),'é','e'),'í','i'),'ó','o'),'ú','u')
+                    replace(replace(replace(replace(replace(s.subject,'Ã¡','a'),'Ã©','e'),'Ã­','i'),'Ã³','o'),'Ãº','u')
                 )) = :subject
                 order by p asc
                 limit 3
@@ -2848,7 +3415,7 @@ def next_items(
                 {"sid": token_student_id, "subject": subj},
             ).mappings().first()
 
-            # Obtener las últimas preguntas contestadas correctamente por IA para evitar repetirlas
+            # Obtener las Ãºltimas preguntas contestadas correctamente por IA para evitar repetirlas
             rows_prompts = conn.execute(
                 text(
                     """
@@ -2879,7 +3446,7 @@ def next_items(
         target_difficulty=str((active_assignment or {}).get("difficulty") or "") or None,
     )
 
-    # 3) Fallback mínimo: si OpenAI falla, usamos la consulta antigua
+    # 3) Fallback mÃ­nimo: si OpenAI falla, usamos la consulta antigua
     custom_rows = []
     if not rows:
         if mode == "adaptive":
@@ -3038,7 +3605,7 @@ def next_items(
         items = items[:k]
 
     if not items:
-        # Como último recurso, proveemos un conjunto mínimo de ejercicios básicos
+        # Como Ãºltimo recurso, proveemos un conjunto mÃ­nimo de ejercicios bÃ¡sicos
         # para evitar que la app quede sin contenido si falta DB o la IA falla.
         items = generate_default_items(subj, k)
         if items:
@@ -3055,7 +3622,7 @@ def next_items(
 
 # ---------------------------
 # GET /reports/student/{sid}
-# KPIs simples + habilidades más débiles
+# KPIs simples + habilidades mÃ¡s dÃ©biles
 # ---------------------------
 @app.get("/reports/student/{sid}")
 def report_student(sid: str, request: Request):
@@ -3160,24 +3727,24 @@ def report_summary(request: Request, sid: str):
     strengths = []
     focus = []
     if accuracy >= 0.8:
-        strengths.append("Muy buena precisión general, sigue así.")
+        strengths.append("Muy buena precisiÃ³n general, sigue asÃ­.")
     elif accuracy >= 0.6:
-        strengths.append("Estás progresando; la precisión va en buen camino.")
+        strengths.append("EstÃ¡s progresando; la precisiÃ³n va en buen camino.")
     else:
-        focus.append("Necesitas subir la precisión general con repasos cortos.")
+        focus.append("Necesitas subir la precisiÃ³n general con repasos cortos.")
 
     if time_avg_s <= 6:
-        strengths.append("Respondes rápido, buen ritmo.")
+        strengths.append("Respondes rÃ¡pido, buen ritmo.")
     else:
-        focus.append("Toma más tiempo para leer enunciados y evitar errores.")
+        focus.append("Toma mÃ¡s tiempo para leer enunciados y evitar errores.")
 
     for w in weak_skills:
         focus.append(f"Refuerza {w['name']} (dominio {int(w['p']*100)}%).")
 
     overview = (
-        f"Llevas {attempts} intentos, con {int(accuracy*100)}% de precisión "
+        f"Llevas {attempts} intentos, con {int(accuracy*100)}% de precisiÃ³n "
         f"y un tiempo medio de {time_avg_s}s. "
-        "Aquí tienes tus siguientes pasos."
+        "AquÃ­ tienes tus siguientes pasos."
     )
 
     return {
