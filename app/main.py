@@ -549,11 +549,11 @@ def update_student_unit_progress(
     last_answer_at,
 ):
     if not unit_key:
-        return
+        return None
 
     unit_name = find_unit_name(subject, unit_key)
     if not unit_name:
-        return
+        return None
 
     row = conn.execute(
         text(
@@ -569,6 +569,7 @@ def update_student_unit_progress(
     base_total = int((row or {}).get("total_attempts") or 0)
     base_correct = int((row or {}).get("correct_attempts") or 0)
     base_mastery = float((row or {}).get("p_mastery") or 0.30)
+    base_accuracy = float((row or {}).get("accuracy") or 0.0)
 
     total_attempts = base_total + 1
     correct_attempts = base_correct + (1 if is_correct else 0)
@@ -625,6 +626,132 @@ def update_student_unit_progress(
             "last_answer_at": last_answer_at,
         },
     )
+    return {
+        "subject": subject,
+        "unit_key": unit_key,
+        "unit_name": unit_name,
+        "previous_total_attempts": base_total,
+        "previous_correct_attempts": base_correct,
+        "previous_accuracy": base_accuracy,
+        "previous_p_mastery": base_mastery,
+        "total_attempts": total_attempts,
+        "correct_attempts": correct_attempts,
+        "accuracy": accuracy,
+        "p_mastery": p_mastery,
+        "status": mastery_label(p_mastery),
+        "last_answer_at": last_answer_at,
+    }
+
+
+def serialize_unit_progress_rows(rows) -> List[dict]:
+    items = []
+    for r in rows:
+        updated_at = r.get("updated_at")
+        last_answer_at = r.get("last_answer_at")
+        items.append(
+            {
+                "subject": r["subject"],
+                "unit_key": r["unit_key"],
+                "unit_name": r["unit_name"],
+                "total_attempts": int(r["total_attempts"] or 0),
+                "correct_attempts": int(r["correct_attempts"] or 0),
+                "accuracy": float(r["accuracy"] or 0.0),
+                "p_mastery": float(r["p_mastery"] or 0.0),
+                "status": mastery_label(float(r["p_mastery"] or 0.0)),
+                "updated_at": updated_at.isoformat() if isinstance(updated_at, (datetime, date)) else updated_at,
+                "last_answer_at": last_answer_at.isoformat() if isinstance(last_answer_at, (datetime, date)) else last_answer_at,
+            }
+        )
+    return items
+
+
+def build_student_missions(conn, student_id: str, subject: str) -> List[dict]:
+    rows = conn.execute(
+        text(
+            """
+            select subject, unit_key, unit_name, total_attempts, correct_attempts, accuracy, p_mastery, updated_at, last_answer_at
+            from student_unit_progress
+            where student_id = :sid and subject = :subject
+            order by p_mastery asc, total_attempts asc, updated_at asc nulls first
+            """
+        ),
+        {"sid": student_id, "subject": subject},
+    ).mappings().all()
+
+    known_units = {r["unit_key"] for r in rows}
+    subject_units = get_curriculum_units(subject)
+    for unit in subject_units:
+        if unit["key"] not in known_units:
+            rows.append(
+                {
+                    "subject": subject,
+                    "unit_key": unit["key"],
+                    "unit_name": unit["name"],
+                    "total_attempts": 0,
+                    "correct_attempts": 0,
+                    "accuracy": 0.0,
+                    "p_mastery": 0.30,
+                    "updated_at": None,
+                    "last_answer_at": None,
+                }
+            )
+
+    rows = sorted(rows, key=lambda r: (float(r.get("p_mastery") or 0.0), int(r.get("total_attempts") or 0)))
+    weakest = rows[0] if rows else None
+    strongest = max(rows, key=lambda r: float(r.get("p_mastery") or 0.0)) if rows else None
+    missions = []
+
+    if weakest:
+        attempts_now = int(weakest.get("total_attempts") or 0)
+        practice_target = max(5, attempts_now if attempts_now else 5)
+        missions.append(
+            {
+                "code": f"practice_{subject}_{weakest['unit_key']}",
+                "title": f"Practica {weakest['unit_name']}",
+                "description": f"Completa {practice_target} intentos acumulados en esta unidad para ganar más base.",
+                "unit_key": weakest["unit_key"],
+                "unit_name": weakest["unit_name"],
+                "subject": subject,
+                "progress": min(attempts_now, practice_target),
+                "target": practice_target,
+                "metric": "attempts",
+                "status": "completed" if attempts_now >= practice_target else "active",
+            }
+        )
+        mastery_now = float(weakest.get("p_mastery") or 0.0)
+        missions.append(
+            {
+                "code": f"mastery_{subject}_{weakest['unit_key']}",
+                "title": f"Sube el dominio en {weakest['unit_name']}",
+                "description": "Lleva esta unidad al nivel 'en progreso' para consolidar la base.",
+                "unit_key": weakest["unit_key"],
+                "unit_name": weakest["unit_name"],
+                "subject": subject,
+                "progress": min(mastery_now, 0.55),
+                "target": 0.55,
+                "metric": "mastery",
+                "status": "completed" if mastery_now >= 0.55 else "active",
+            }
+        )
+
+    if strongest:
+        mastery_now = float(strongest.get("p_mastery") or 0.0)
+        missions.append(
+            {
+                "code": f"dominate_{subject}_{strongest['unit_key']}",
+                "title": f"Domina {strongest['unit_name']}",
+                "description": "Lleva esta unidad a nivel de dominio alto.",
+                "unit_key": strongest["unit_key"],
+                "unit_name": strongest["unit_name"],
+                "subject": subject,
+                "progress": min(mastery_now, 0.80),
+                "target": 0.80,
+                "metric": "mastery",
+                "status": "completed" if mastery_now >= 0.80 else "active",
+            }
+        )
+
+    return missions[:3]
 
 
 def update_assignment_progress(
@@ -1184,6 +1311,8 @@ IMPORTANTE:
 - Para cada ejercicio, asigna el unit_key correcto según la unidad curricular trabajada.
 - unit_key debe ser exactamente uno de estos valores: {valid_keys_text}
 - Si se indica una unidad prioritaria, concentra la mayoría de los ejercicios en esa unidad.
+- Si la materia es "matematica" y NO hay unidad prioritaria, distribuye el lote entre distintas unidades curriculares y evita concentrar todo en "operaciones_naturales".
+- Si la materia es "matematica" y generas 3 o más ejercicios sin unidad prioritaria, incluye al menos 2 unit_key distintos.
 - Si se indica una dificultad prioritaria, respétala al redactar los ejercicios.
 - Si la pregunta tiene una unica respuesta objetiva o es de opcion multiple, usa evaluation_mode="exact".
 - Si la pregunta de Castellano admite varias palabras correctas razonables, usa evaluation_mode="accepted_answers" y llena accepted_answers con 3 a 6 variantes validas.
@@ -1281,6 +1410,15 @@ Ejemplo de salida:
                     }
                 )
 
+            if (
+                subject == "matematica"
+                and not target_unit_key
+                and k >= 3
+                and len({str(item.get("unit_key") or "") for item in results if item.get("unit_key")}) < 2
+            ):
+                logger.warning("AI items lacked unit diversity for matematica; retrying generation")
+                continue
+
             if results:
                 _set_cached_items(cache_key, results)
                 return results
@@ -1313,6 +1451,8 @@ def generate_default_items(subject: str, k: int) -> List[dict]:
                 "options": ["3", "4", "5", "6"],
                 "answer": "5",
                 "subject": subject,
+                "unit_key": "operaciones_naturales",
+                "unit_name": "Operaciones Naturales",
                 "evaluation_mode": "exact",
                 "accepted_answers": [],
                 "rubric": "",
@@ -1325,6 +1465,36 @@ def generate_default_items(subject: str, k: int) -> List[dict]:
                 "options": [],
                 "answer": "11",
                 "subject": subject,
+                "unit_key": "operaciones_naturales",
+                "unit_name": "Operaciones Naturales",
+                "evaluation_mode": "exact",
+                "accepted_answers": [],
+                "rubric": "",
+                "reason": "fallback",
+            },
+            {
+                "id": base_id - 2,
+                "type": "fallback",
+                "prompt": "¿Cuál figura tiene 4 lados?",
+                "options": ["Triángulo", "Cuadrado", "Círculo", "Óvalo"],
+                "answer": "Cuadrado",
+                "subject": subject,
+                "unit_key": "geometria_y_medida",
+                "unit_name": "Geometria y Medida",
+                "evaluation_mode": "exact",
+                "accepted_answers": [],
+                "rubric": "",
+                "reason": "fallback",
+            },
+            {
+                "id": base_id - 3,
+                "type": "fallback",
+                "prompt": "En una tabla de datos, ¿qué usamos para organizar cuántas veces aparece cada valor?",
+                "options": ["Frecuencia", "Perímetro", "Multiplicación", "Resta"],
+                "answer": "Frecuencia",
+                "subject": subject,
+                "unit_key": "estadistica",
+                "unit_name": "Estadistica",
                 "evaluation_mode": "exact",
                 "accepted_answers": [],
                 "rubric": "",
@@ -1676,22 +1846,39 @@ def teacher_student_unit_progress(sid: str, request: Request):
             ),
             {"sid": sid},
         ).mappings().all()
-    return {
-        "units": [
-            {
-                "subject": r["subject"],
-                "unit_key": r["unit_key"],
-                "unit_name": r["unit_name"],
-                "total_attempts": int(r["total_attempts"] or 0),
-                "correct_attempts": int(r["correct_attempts"] or 0),
-                "accuracy": float(r["accuracy"] or 0),
-                "p_mastery": float(r["p_mastery"] or 0),
-                "status": mastery_label(float(r["p_mastery"] or 0)),
-                "updated_at": r["updated_at"].isoformat() if r.get("updated_at") else None,
-            }
-            for r in rows
-        ]
-    }
+    return {"units": serialize_unit_progress_rows(rows)}
+
+
+@app.get("/students/{sid}/unit-progress")
+def student_unit_progress(sid: str, request: Request, subject: Optional[str] = None):
+    requester = require_user(request, allowed_roles=["student", "teacher"])
+    if requester["role"] == "student" and str(requester["id"]) != sid:
+        raise HTTPException(status_code=403, detail="No autorizado")
+
+    sql = """
+        select subject, unit_key, unit_name, total_attempts, correct_attempts, accuracy, p_mastery, updated_at, last_answer_at
+        from student_unit_progress
+        where student_id = :sid
+    """
+    params = {"sid": sid}
+    if subject:
+        sql += " and subject = :subject"
+        params["subject"] = subject.strip().lower()
+    sql += " order by subject, p_mastery asc, updated_at desc nulls last"
+
+    with engine.begin() as conn:
+        rows = conn.execute(text(sql), params).mappings().all()
+    return {"units": serialize_unit_progress_rows(rows)}
+
+
+@app.get("/students/{sid}/missions")
+def student_missions(sid: str, request: Request, subject: str = Query(...)):
+    requester = require_user(request, allowed_roles=["student", "teacher"])
+    if requester["role"] == "student" and str(requester["id"]) != sid:
+        raise HTTPException(status_code=403, detail="No autorizado")
+    with engine.begin() as conn:
+        missions = build_student_missions(conn, sid, subject.strip().lower())
+    return {"missions": missions}
 
 
 @app.get("/teacher/students/{sid}/errors")
@@ -2334,7 +2521,7 @@ async def post_attempt(request: Request):
 
         # 4) Guardamos intento + actualizamos progreso
         attempt_id, p = save_attempt_and_update_progress(conn, attempt_dict)
-        update_student_unit_progress(
+        unit_progress = update_student_unit_progress(
             conn,
             student_id=attempt_dict["student_id"],
             subject=str(attempt_dict["subject"]),
@@ -2350,6 +2537,32 @@ async def post_attempt(request: Request):
             attempt_created_at=p.get("last_answer_at"),
         )
         unlocked = []
+        if unit_progress:
+            previous_mastery = float(unit_progress.get("previous_p_mastery") or 0.0)
+            current_mastery = float(unit_progress.get("p_mastery") or 0.0)
+            unit_name = str(unit_progress.get("unit_name") or "Unidad")
+            unit_key = str(unit_progress.get("unit_key") or "")
+            subject_key = str(unit_progress.get("subject") or "")
+            if previous_mastery < 0.55 <= current_mastery:
+                ach = award_achievement(
+                    conn,
+                    attempt_dict["student_id"],
+                    f"unit_progress_{subject_key}_{unit_key}",
+                    f"Avance en {unit_name}",
+                    f"Llevaste {unit_name} al nivel en progreso.",
+                )
+                if ach:
+                    unlocked.append(ach)
+            if previous_mastery < 0.80 <= current_mastery:
+                ach = award_achievement(
+                    conn,
+                    attempt_dict["student_id"],
+                    f"unit_mastery_{subject_key}_{unit_key}",
+                    f"Dominio de {unit_name}",
+                    f"Alcanzaste dominio alto en la unidad {unit_name}.",
+                )
+                if ach:
+                    unlocked.append(ach)
         # Reglas de logros básicos
         if p["current_streak"] >= 5:
             ach = award_achievement(
@@ -2428,6 +2641,7 @@ async def post_attempt(request: Request):
         "achievements_unlocked": unlocked,
         "feedback": feedback_msg,
         "is_correct": bool(attempt_dict["is_correct"]),
+        "unit_progress": unit_progress,
     }
 
 @app.get("/progress", response_model=ProgressOut)
