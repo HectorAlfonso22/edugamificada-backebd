@@ -64,11 +64,14 @@ def parse_cors_origins(raw: Optional[str]) -> list[str]:
 # Configuración / Conexión DB
 # ---------------------------
 DATABASE_URL = os.getenv("DATABASE_URL")
-logger.info("DATABASE_URL = %s", DATABASE_URL)
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is not configured")
+logger.info("DATABASE_URL configured")
 
 # Comprobar DNS del host (opcional, para debug):
 try:
-    host = DATABASE_URL.split("@")[1].split(":")[0]  # db.<ref>.supabase.co
+    host_part = DATABASE_URL.split("@", 1)[1] if "@" in DATABASE_URL else DATABASE_URL.split("//", 1)[-1]
+    host = host_part.split("/", 1)[0].split(":", 1)[0]
     logger.info("DB HOST = %s -> %s", host, socket.gethostbyname(host))
 except Exception as e:
     logger.warning("DNS lookup failed: %s", e)
