@@ -21,6 +21,7 @@ from openai import OpenAI
 from passlib.context import CryptContext
 from pydantic import BaseModel
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.schemas import AttemptIn, AttemptOut, ProgressOut
 from app.services.progress import save_attempt_and_update_progress, SELECT_PROGRESS
@@ -44,12 +45,23 @@ if not logger.handlers:
     logger.addHandler(stream_handler)
 logger.propagate = False
 
-# Carga variables de entorno antes de leer DATABASE_URL (carga explÃ­cita del .env en el backend)
+# Carga variables de entorno antes de leer DATABASE_URL (carga explícita del .env en el backend)
 load_dotenv(BASE_DIR / ".env")
 logger.info("Loaded .env from %s", BASE_DIR / ".env")
 
+
+def parse_cors_origins(raw: Optional[str]) -> list[str]:
+    if raw and raw.strip():
+        return [origin.strip() for origin in raw.split(",") if origin.strip()]
+    return [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ]
+
 # ---------------------------
-# ConfiguraciÃ³n / ConexiÃ³n DB
+# Configuración / Conexión DB
 # ---------------------------
 DATABASE_URL = os.getenv("DATABASE_URL")
 logger.info("DATABASE_URL = %s", DATABASE_URL)
@@ -371,7 +383,7 @@ def ensure_custom_tables():
 
 ensure_custom_tables()
 
-# ParÃ¡metros BKT-lite (puedes ajustarlos en .env)
+# Parámetros BKT-lite (puedes ajustarlos en .env)
 SLIP  = float(os.getenv("SLIP", 0.10))
 GUESS = float(os.getenv("GUESS", 0.20))
 LEARN = float(os.getenv("LEARN", 0.15))
@@ -385,7 +397,7 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 logger.info("OpenAI client configured: %s", bool(openai_client))
 
-# Cache simple en memoria para evitar llamar a la IA repetidamente con los mismos parÃ¡metros
+# Cache simple en memoria para evitar llamar a la IA repetidamente con los mismos parámetros
 _AI_ITEMS_CACHE: dict = {}
 _CACHE_LOCK = threading.Lock()
 _CACHE_TTL_SECONDS = 90
@@ -400,7 +412,7 @@ app = FastAPI(title="EduGamificada API", version="0.1")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "*"],
+    allow_origins=parse_cors_origins(os.getenv("CORS_ORIGINS")),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -412,7 +424,7 @@ app.add_middleware(
 class AttemptIn(BaseModel):
     student_id: str
     item_id: int
-    # Puedes enviar directamente la correcciÃ³n...
+    # Puedes enviar directamente la corrección...
     correct: Optional[bool] = None
     # ...o enviar la respuesta para validarla server-side:
     answer_text: Optional[str] = None
@@ -704,15 +716,15 @@ def build_strengths_fallback(accuracy: float, attempts: int, time_avg_s: float) 
     strengths: List[str] = []
     acc_pct = int(accuracy * 100)
     if accuracy >= 0.8:
-        strengths.append(f"PrecisiÃ³n sÃ³lida ({acc_pct}%).")
+        strengths.append(f"Precisión sólida ({acc_pct}%).")
     elif accuracy >= 0.6:
-        strengths.append(f"PrecisiÃ³n aceptable ({acc_pct}%), sigue reforzando.")
+        strengths.append(f"Precisión aceptable ({acc_pct}%), sigue reforzando.")
     if attempts >= 10:
         strengths.append(f"Constancia: {attempts} intentos acumulados.")
     if time_avg_s and time_avg_s <= 8:
         strengths.append(f"Buen ritmo de respuesta ({time_avg_s}s).")
     if not strengths:
-        strengths.append("ContinÃºas practicando, sigue asÃ­.")
+        strengths.append("Continúas practicando, sigue así.")
     return strengths
 
 
@@ -955,7 +967,7 @@ def build_student_missions(conn, student_id: str, subject: str) -> List[dict]:
             {
                 "code": f"practice_{subject}_{weakest['unit_key']}",
                 "title": f"Practica {weakest['unit_name']}",
-                "description": f"Completa {practice_target} intentos acumulados en esta unidad para ganar mÃ¡s base.",
+                "description": f"Completa {practice_target} intentos acumulados en esta unidad para ganar más base.",
                 "unit_key": weakest["unit_key"],
                 "unit_name": weakest["unit_name"],
                 "subject": subject,
@@ -1144,16 +1156,16 @@ def generate_ai_summary(context: dict) -> Optional[dict]:
     prompt = f"""
 Eres un tutor educativo. Usa estos datos:
 - Intentos: {context['attempts']}
-- PrecisiÃ³n: {context['accuracy_percent']}%
+- Precisión: {context['accuracy_percent']}%
 - Tiempo promedio (s): {context['time_avg_s']}
-- Habilidades mÃ¡s dÃ©biles: {context['weak_list']}
+- Habilidades más débiles: {context['weak_list']}
 
 Devuelve SIEMPRE un JSON con:
-- overview: frase breve (1-2 lÃ­neas)
-- strengths: lista con al menos 2 fortalezas concretas (ej: "PrecisiÃ³n sÃ³lida", "Buen ritmo", "Constancia en intentos")
-- focus: lista con al menos 2 prÃ³ximos pasos accionables (ej: "Practicar Sumas 0-20", "Repasar Restas 0-10")
+- overview: frase breve (1-2 líneas)
+- strengths: lista con al menos 2 fortalezas concretas (ej: "Precisión sólida", "Buen ritmo", "Constancia en intentos")
+- focus: lista con al menos 2 próximos pasos accionables (ej: "Practicar Sumas 0-20", "Repasar Restas 0-10")
 
-SÃ© conciso, positivo y especÃ­fico.
+Sé conciso, positivo y específico.
 """
     models_to_try = [OPENAI_MODEL] if OPENAI_MODEL else []
     if "gpt-4o-mini" not in models_to_try:
@@ -1181,25 +1193,25 @@ SÃ© conciso, positivo y especÃ­fico.
 
 
 def generate_ai_feedback(question: str, user_answer: str, correct_answer: str, subject: str) -> Optional[str]:
-    """Genera una retroalimentaciÃ³n breve y motivadora cuando la respuesta es incorrecta."""
+    """Genera una retroalimentación breve y motivadora cuando la respuesta es incorrecta."""
     if not openai_client:
         return None
 
     prompt = f"""
-Eres un docente amable y motivador. El alumno respondiÃ³ mal a una pregunta.
+Eres un docente amable y motivador. El alumno respondió mal a una pregunta.
 
 Pregunta: {question}
 Respuesta del alumno: {user_answer}
 Respuesta correcta: {correct_answer}
 Materia: {subject}
 
-Da una retroalimentaciÃ³n corta (1-2 oraciones) explicando:
-- por quÃ© la opciÃ³n del alumno no es correcta
-- cÃ³mo llegar a la respuesta correcta
+Da una retroalimentación corta (1-2 oraciones) explicando:
+- por qué la opción del alumno no es correcta
+- cómo llegar a la respuesta correcta
 
-SÃ© positivo, evita sonar crÃ­tico y no incluyas la palabra 'incorrecto' al inicio.
+Sé positivo, evita sonar crítico y no incluyas la palabra 'incorrecto' al inicio.
 
-Responde solo con el texto de retroalimentaciÃ³n, sin encabezados ni formato extra.
+Responde solo con el texto de retroalimentación, sin encabezados ni formato extra.
 """
 
     models_to_try = [OPENAI_MODEL] if OPENAI_MODEL else []
@@ -1357,7 +1369,7 @@ Genera exactamente un JSON con una lista "items" para que el profesor pueda revi
 Materia: {subject}
 Unidad: {unit_name} ({unit_key})
 Dificultad sugerida: {difficulty or 'media'}
-Objetivo pedagÃ³gico: {objective or 'reforzar contenidos clave del tercer grado'}
+Objetivo pedagógico: {objective or 'reforzar contenidos clave del tercer grado'}
 Cantidad: {count}
 
 Cada item debe tener:
@@ -1369,9 +1381,9 @@ Cada item debe tener:
 - rubric
 
 Reglas:
-- Si es opciÃ³n mÃºltiple usa evaluation_mode="exact".
-- Si es respuesta abierta de Castellano con varias respuestas vÃ¡lidas, usa evaluation_mode="accepted_answers" o "ai_judge" cuando haga falta criterio.
-- MantÃ©n el nivel adecuado para tercer grado.
+- Si es opción múltiple usa evaluation_mode="exact".
+- Si es respuesta abierta de Castellano con varias respuestas válidas, usa evaluation_mode="accepted_answers" o "ai_judge" cuando haga falta criterio.
+- Mantén el nivel adecuado para tercer grado.
 
 Devuelve solo JSON.
 """
@@ -1439,7 +1451,7 @@ def _get_cached_items(key: str) -> Optional[List[dict]]:
 def _set_cached_items(key: str, items: List[dict]) -> None:
     with _CACHE_LOCK:
         if len(_AI_ITEMS_CACHE) >= _CACHE_MAX_ENTRIES:
-            # borrar el cache mÃ¡s viejo
+            # borrar el cache más viejo
             oldest = min(_AI_ITEMS_CACHE.items(), key=lambda kv: kv[1]["ts"])[0]
             del _AI_ITEMS_CACHE[oldest]
         _AI_ITEMS_CACHE[key] = {"ts": time.time(), "items": items}
@@ -1489,7 +1501,7 @@ def generate_ai_items(
         ctx_lines.append(f"Precision actual: {acc * 100:.0f}%" if acc is not None else "")
         ctx_lines.append(f"Intentos totales: {attempts}" if attempts is not None else "")
         if weak:
-            ctx_lines.append(f"Habilidades dÃ©biles: {', '.join(weak)}")
+            ctx_lines.append(f"Habilidades débiles: {', '.join(weak)}")
         if weak_units_ctx:
             ctx_lines.append(
                 "Unidades a fortalecer: "
@@ -1531,7 +1543,7 @@ def generate_ai_items(
 
     prompt = f"""
 Eres un tutor educativo de primaria.
-Genera exactamente un JSON vÃ¡lido con un arreglo llamado "items".
+Genera exactamente un JSON válido con un arreglo llamado "items".
 Cada item debe tener:
   - prompt: texto de la pregunta
   - options: lista de opciones (puede ser [] para respuesta libre)
@@ -1554,22 +1566,22 @@ Unidades curriculares permitidas para {subject}:
 {curriculum_prompt}
 
 IMPORTANTE:
-- Si la materia es "castellano", SOLO genera ejercicios de lengua (gramÃ¡tica, ortografÃ­a, lectura, vocabulario, comprensiÃ³n). NO incluyas operaciones numÃ©ricas ni problemas matemÃ¡ticos.
-- Si la materia es "matematica", SOLO genera ejercicios de matemÃ¡ticas (aritmÃ©tica, lÃ³gica, problemas numÃ©ricos). NO incluyas preguntas de idioma.
-- Para cada ejercicio, asigna el unit_key correcto segÃºn la unidad curricular trabajada.
+- Si la materia es "castellano", SOLO genera ejercicios de lengua (gramática, ortografía, lectura, vocabulario, comprensión). NO incluyas operaciones numéricas ni problemas matemáticos.
+- Si la materia es "matematica", SOLO genera ejercicios de matemáticas (aritmética, lógica, problemas numéricos). NO incluyas preguntas de idioma.
+- Para cada ejercicio, asigna el unit_key correcto según la unidad curricular trabajada.
 - unit_key debe ser exactamente uno de estos valores: {valid_keys_text}
-- Si se indica una unidad prioritaria, concentra la mayorÃ­a de los ejercicios en esa unidad.
+- Si se indica una unidad prioritaria, concentra la mayoría de los ejercicios en esa unidad.
 - Si la materia es "matematica" y NO hay unidad prioritaria, distribuye el lote entre distintas unidades curriculares y evita concentrar todo en "operaciones_naturales".
-- Si la materia es "matematica" y generas 3 o mÃ¡s ejercicios sin unidad prioritaria, incluye al menos 2 unit_key distintos.
-- Si se indica una dificultad prioritaria, respÃ©tala al redactar los ejercicios.
+- Si la materia es "matematica" y generas 3 o más ejercicios sin unidad prioritaria, incluye al menos 2 unit_key distintos.
+- Si se indica una dificultad prioritaria, respétala al redactar los ejercicios.
 - Si la pregunta tiene una unica respuesta objetiva o es de opcion multiple, usa evaluation_mode="exact".
 - Si la pregunta de Castellano admite varias palabras correctas razonables, usa evaluation_mode="accepted_answers" y llena accepted_answers con 3 a 6 variantes validas.
 - Si la pregunta de Castellano es abierta y requiere criterio semantico o gramatical mas amplio, usa evaluation_mode="ai_judge" y explica el criterio en rubric.
 - No uses "ai_judge" para matematica.
 
 Haz {k} ejercicios.
-- Incluye al menos 1 ejercicio de opciÃ³n mÃºltiple y al menos 1 ejercicio de respuesta libre.
-- Prioriza fortalecer las habilidades dÃ©biles y las unidades a reforzar listadas, y ajusta la dificultad si el estudiante ya tiene buena precisiÃ³n.
+- Incluye al menos 1 ejercicio de opción múltiple y al menos 1 ejercicio de respuesta libre.
+- Prioriza fortalecer las habilidades débiles y las unidades a reforzar listadas, y ajusta la dificultad si el estudiante ya tiene buena precisión.
 
 Devuelve SOLO el JSON, sin texto adicional.
 Ejemplo de salida:
@@ -1686,7 +1698,7 @@ Ejemplo de salida:
 
 
 def generate_default_items(subject: str, k: int) -> List[dict]:
-    """Fallback muy bÃ¡sico cuando no hay datos en DB ni IA disponible."""
+    """Fallback muy básico cuando no hay datos en DB ni IA disponible."""
     base_id = -int(datetime.utcnow().timestamp() * 1000)
     items: List[dict] = []
 
@@ -1695,7 +1707,7 @@ def generate_default_items(subject: str, k: int) -> List[dict]:
             {
                 "id": base_id,
                 "type": "fallback",
-                "prompt": "Â¿CuÃ¡nto es 2 + 3?",
+                "prompt": "¿Cuánto es 2 + 3?",
                 "options": ["3", "4", "5", "6"],
                 "answer": "5",
                 "subject": subject,
@@ -1723,7 +1735,7 @@ def generate_default_items(subject: str, k: int) -> List[dict]:
             {
                 "id": base_id - 2,
                 "type": "fallback",
-                "prompt": "Â¿CuÃ¡l figura tiene 4 lados?",
+                "prompt": "¿Cuál figura tiene 4 lados?",
                 "options": ["TriÃ¡ngulo", "Cuadrado", "CÃ­rculo", "Ã“valo"],
                 "answer": "Cuadrado",
                 "subject": subject,
@@ -1737,8 +1749,8 @@ def generate_default_items(subject: str, k: int) -> List[dict]:
             {
                 "id": base_id - 3,
                 "type": "fallback",
-                "prompt": "En una tabla de datos, Â¿quÃ© usamos para organizar cuÃ¡ntas veces aparece cada valor?",
-                "options": ["Frecuencia", "PerÃ­metro", "MultiplicaciÃ³n", "Resta"],
+                "prompt": "En una tabla de datos, ¿qué usamos para organizar cuántas veces aparece cada valor?",
+                "options": ["Frecuencia", "Perímetro", "Multiplicación", "Resta"],
                 "answer": "Frecuencia",
                 "subject": subject,
                 "unit_key": "estadistica",
@@ -1754,7 +1766,7 @@ def generate_default_items(subject: str, k: int) -> List[dict]:
             {
                 "id": base_id,
                 "type": "fallback",
-                "prompt": "Â¿CuÃ¡l es la palabra correcta: 'casa' o 'cassa'?",
+                "prompt": "¿Cuál es la palabra correcta: 'casa' o 'cassa'?",
                 "options": ["casa", "cassa"],
                 "answer": "casa",
                 "subject": subject,
@@ -1771,7 +1783,7 @@ def generate_default_items(subject: str, k: int) -> List[dict]:
                 "answer": "negro",
                 "subject": subject,
                 "evaluation_mode": "accepted_answers",
-                "accepted_answers": ["negra", "bonito", "bonita", "feliz", "pequeno", "pequeÃ±o"],
+                "accepted_answers": ["negra", "bonito", "bonita", "feliz", "pequeno", "pequeño"],
                 "rubric": "Acepta adjetivos validos y coherentes para describir al gato.",
                 "reason": "fallback",
             },
@@ -1785,7 +1797,7 @@ def get_token_from_request(request: Request) -> str:
     auth_header = request.headers.get("Authorization") or ""
     scheme, _, token = auth_header.partition(" ")
     if scheme.lower() != "bearer" or not token:
-        raise HTTPException(status_code=401, detail="Token de autenticaciÃ³n requerido")
+        raise HTTPException(status_code=401, detail="Token de autenticación requerido")
     return token
 
 
@@ -1794,7 +1806,7 @@ def require_user(request: Request, allowed_roles: Optional[List[str]] = None) ->
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
     except JWTError:
-        raise HTTPException(status_code=401, detail="Token invÃ¡lido")
+        raise HTTPException(status_code=401, detail="Token inválido")
 
     user_id = payload.get("sub")
     if not user_id:
@@ -1837,7 +1849,7 @@ def award_achievement(conn, student_id: str, code: str, title: str, desc: str) -
     return None
 
 # ---------------------------
-# Endpoints bÃ¡sicos de salud
+# Endpoints básicos de salud
 # ---------------------------
 @app.get("/health")
 def health():
@@ -1851,13 +1863,13 @@ def db_check():
 
 
 # ---------------------------
-# AutenticaciÃ³n y perfiles
+# Autenticación y perfiles
 # ---------------------------
 @app.post("/auth/register")
 def register_user(payload: RegisterPayload):
     role = payload.role.lower()
     if role not in {"student", "teacher"}:
-        raise HTTPException(status_code=400, detail="Rol invÃ¡lido")
+        raise HTTPException(status_code=400, detail="Rol inválido")
 
     if payload.age is not None and (payload.age < 3 or payload.age > 120):
         raise HTTPException(status_code=400, detail="Edad fuera de rango")
@@ -1868,7 +1880,7 @@ def register_user(payload: RegisterPayload):
     with engine.begin() as conn:
         existing = conn.execute(SELECT_USER_BY_EMAIL, {"email": payload.email}).mappings().first()
         if existing:
-            raise HTTPException(status_code=400, detail="Ese email ya estÃ¡ registrado")
+            raise HTTPException(status_code=400, detail="Ese email ya está registrado")
 
         row = conn.execute(
             INSERT_USER_SQL,
@@ -1888,11 +1900,18 @@ def register_user(payload: RegisterPayload):
 
 @app.post("/auth/login")
 def login_user(payload: LoginPayload):
-    with engine.begin() as conn:
-        row = conn.execute(SELECT_USER_BY_EMAIL, {"email": payload.email}).mappings().first()
+    try:
+        with engine.begin() as conn:
+            row = conn.execute(SELECT_USER_BY_EMAIL, {"email": payload.email}).mappings().first()
+    except SQLAlchemyError as exc:
+        logger.error("Login failed due to database error: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail="No se pudo conectar a la base de datos",
+        ) from exc
 
     if not row or not verify_password(payload.password, row["password_hash"]):
-        raise HTTPException(status_code=401, detail="Credenciales invÃ¡lidas")
+        raise HTTPException(status_code=401, detail="Credenciales inválidas")
 
     token = create_access_token(str(row["id"]))
     return {"token": token, "user": sanitize_user(row)}
@@ -1993,7 +2012,7 @@ def create_friend_request(payload: FriendRequestCreatePayload, request: Request)
             {"friend_code": friend_code},
         ).mappings().first()
         if not target:
-            raise HTTPException(status_code=404, detail="CÃ³digo de amigo no encontrado")
+            raise HTTPException(status_code=404, detail="Código de amigo no encontrado")
         if str(target["student_id"]) == str(student["id"]):
             raise HTTPException(status_code=400, detail="No puedes agregarte a ti mismo")
         if are_friends(conn, str(student["id"]), str(target["student_id"])):
@@ -2241,10 +2260,10 @@ def create_custom_question(payload: CustomQuestionPayload, request: Request):
     if not payload.prompt.strip() or not payload.answer.strip():
         raise HTTPException(status_code=400, detail="Completa enunciado y respuesta")
     if payload.unit_key and payload.unit_key not in valid_unit_keys(payload.subject):
-        raise HTTPException(status_code=400, detail="Unidad invÃ¡lida")
+        raise HTTPException(status_code=400, detail="Unidad inválida")
     evaluation_mode = (payload.evaluation_mode or "exact").strip().lower()
     if evaluation_mode not in {"exact", "accepted_answers", "ai_judge"}:
-        raise HTTPException(status_code=400, detail="Modo de evaluaciÃ³n invÃ¡lido")
+        raise HTTPException(status_code=400, detail="Modo de evaluación inválido")
     if payload.subject != "castellano" and evaluation_mode == "ai_judge":
         raise HTTPException(status_code=400, detail="ai_judge solo aplica a Castellano")
 
@@ -2271,7 +2290,7 @@ def create_custom_question(payload: CustomQuestionPayload, request: Request):
 @app.put("/teacher/questions/{question_id}")
 def update_custom_question(question_id: int, payload: CustomQuestionPayload, request: Request):
     if question_id <= 0:
-        raise HTTPException(status_code=400, detail="ID invÃ¡lido")
+        raise HTTPException(status_code=400, detail="ID inválido")
 
     teacher = require_user(request, allowed_roles=["teacher"])
     norm_options = [str(o).strip() for o in payload.options if str(o).strip()]
@@ -2593,7 +2612,7 @@ def list_teacher_assignments(request: Request, student_id: Optional[str] = None)
 def create_teacher_assignment(payload: TeacherAssignmentPayload, request: Request):
     teacher = require_user(request, allowed_roles=["teacher"])
     if payload.unit_key not in valid_unit_keys(payload.subject):
-        raise HTTPException(status_code=400, detail="Unidad invÃ¡lida")
+        raise HTTPException(status_code=400, detail="Unidad inválida")
     with engine.begin() as conn:
         row = conn.execute(
             text(
@@ -2738,7 +2757,7 @@ def teacher_dashboard(request: Request):
                 {
                     "student_id": sid,
                     "student_name": info["student_name"],
-                    "reason": f"Sin actividad desde hace {(now_dt - last_answer).days} dÃ­as",
+                    "reason": f"Sin actividad desde hace {(now_dt - last_answer).days} días",
                 }
             )
         low_subjects = [
@@ -2809,7 +2828,7 @@ def teacher_dashboard(request: Request):
     if inactive:
         recommendations.append(f"Hay {len(inactive)} alumnos con baja actividad reciente.")
     if at_risk:
-        recommendations.append(f"{len(at_risk)} alumnos presentan riesgo acadÃ©mico en al menos una materia.")
+        recommendations.append(f"{len(at_risk)} alumnos presentan riesgo académico en al menos una materia.")
 
     return {
         "overview": {
@@ -2894,7 +2913,7 @@ def daily_progress(request: Request, sid: str, subject: Optional[str] = None):
     dates_counts = {r["d"]: int(r["n"]) for r in rows}
     if today in dates_counts:
         attempts_today = dates_counts[today]
-    # calcular racha desde hoy hacia atrÃ¡s
+    # calcular racha desde hoy hacia atrás
     cursor = today
     while cursor in dates_counts and dates_counts[cursor] > 0:
         streak_days += 1
@@ -3046,7 +3065,7 @@ async def post_attempt(request: Request):
         "response": body.get("response", body.get("answer_text")),
         "time_ms": body.get("time_ms", 0),
         "hints_used": body.get("hints_used", 0),
-        "subject": body.get("subject"),  # puede venir vacÃ­o
+        "subject": body.get("subject"),  # puede venir vacío
         "prompt": body.get("prompt"),
         "unit_key": body.get("unit_key"),
         "correct_answer": body.get("correct_answer") or body.get("answer"),
@@ -3056,7 +3075,7 @@ async def post_attempt(request: Request):
         "rubric": body.get("rubric"),
     }
 
-    # ValidaciÃ³n mÃ­nima
+    # Validación mínima
     if attempt_dict["item_id"] is None:
         raise HTTPException(status_code=400, detail="item_id es obligatorio")
 
@@ -3130,7 +3149,7 @@ async def post_attempt(request: Request):
                 )
                 if ach:
                     unlocked.append(ach)
-        # Reglas de logros bÃ¡sicos
+        # Reglas de logros básicos
         if p["current_streak"] >= 5:
             ach = award_achievement(
                 conn,
@@ -3147,8 +3166,8 @@ async def post_attempt(request: Request):
                 conn,
                 attempt_dict["student_id"],
                 "accuracy_80",
-                "PrecisiÃ³n 80%",
-                "Mantienes una precisiÃ³n de 80% o mÃ¡s.",
+                "Precisión 80%",
+                "Mantienes una precisión de 80% o más.",
             )
             if ach:
                 unlocked.append(ach)
@@ -3178,7 +3197,7 @@ async def post_attempt(request: Request):
 
     feedback_msg = None
     if not attempt_dict.get("is_correct"):
-        # Generar retroalimentaciÃ³n personalizada usando AI (si estÃ¡ configurado)
+        # Generar retroalimentación personalizada usando AI (si está configurado)
         try:
             feedback_msg = generate_ai_feedback(
                 question=str(attempt_dict.get("prompt") or ""),
@@ -3248,7 +3267,7 @@ def get_progress(student_id: UUID, subject: str):
 # ---------------------------
 # GET /next-items
 # Recomendador simple: prioriza habilidades con menor dominio,
-# incluye revisiÃ³n por SRS y hace Îµ-greedy (explora un poco).
+# incluye revisión por SRS y hace epsilon-greedy (explora un poco).
 # ---------------------------
 @app.get("/next-items")
 def next_items(
@@ -3415,7 +3434,7 @@ def next_items(
                 {"sid": token_student_id, "subject": subj},
             ).mappings().first()
 
-            # Obtener las Ãºltimas preguntas contestadas correctamente por IA para evitar repetirlas
+            # Obtener las últimas preguntas contestadas correctamente por IA para evitar repetirlas
             rows_prompts = conn.execute(
                 text(
                     """
@@ -3446,7 +3465,7 @@ def next_items(
         target_difficulty=str((active_assignment or {}).get("difficulty") or "") or None,
     )
 
-    # 3) Fallback mÃ­nimo: si OpenAI falla, usamos la consulta antigua
+    # 3) Fallback mínimo: si OpenAI falla, usamos la consulta antigua
     custom_rows = []
     if not rows:
         if mode == "adaptive":
@@ -3605,7 +3624,7 @@ def next_items(
         items = items[:k]
 
     if not items:
-        # Como Ãºltimo recurso, proveemos un conjunto mÃ­nimo de ejercicios bÃ¡sicos
+        # Como último recurso, proveemos un conjunto mínimo de ejercicios básicos
         # para evitar que la app quede sin contenido si falta DB o la IA falla.
         items = generate_default_items(subj, k)
         if items:
@@ -3622,7 +3641,7 @@ def next_items(
 
 # ---------------------------
 # GET /reports/student/{sid}
-# KPIs simples + habilidades mÃ¡s dÃ©biles
+# KPIs simples + habilidades más débiles
 # ---------------------------
 @app.get("/reports/student/{sid}")
 def report_student(sid: str, request: Request):
@@ -3727,24 +3746,24 @@ def report_summary(request: Request, sid: str):
     strengths = []
     focus = []
     if accuracy >= 0.8:
-        strengths.append("Muy buena precisiÃ³n general, sigue asÃ­.")
+        strengths.append("Muy buena precisión general, sigue así.")
     elif accuracy >= 0.6:
-        strengths.append("EstÃ¡s progresando; la precisiÃ³n va en buen camino.")
+        strengths.append("Estás progresando; la precisión va en buen camino.")
     else:
-        focus.append("Necesitas subir la precisiÃ³n general con repasos cortos.")
+        focus.append("Necesitas subir la precisión general con repasos cortos.")
 
     if time_avg_s <= 6:
-        strengths.append("Respondes rÃ¡pido, buen ritmo.")
+        strengths.append("Respondes rápido, buen ritmo.")
     else:
-        focus.append("Toma mÃ¡s tiempo para leer enunciados y evitar errores.")
+        focus.append("Toma más tiempo para leer enunciados y evitar errores.")
 
     for w in weak_skills:
         focus.append(f"Refuerza {w['name']} (dominio {int(w['p']*100)}%).")
 
     overview = (
-        f"Llevas {attempts} intentos, con {int(accuracy*100)}% de precisiÃ³n "
+        f"Llevas {attempts} intentos, con {int(accuracy*100)}% de precisión "
         f"y un tiempo medio de {time_avg_s}s. "
-        "AquÃ­ tienes tus siguientes pasos."
+        "Aquí tienes tus siguientes pasos."
     )
 
     return {
